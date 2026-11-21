@@ -139,14 +139,24 @@ def set_folders(conn, plan, folders):
 
 # ---------------------------------------------------------------- scan
 def scan(conn, plan, progress=None):
-    pid, root = plan["plan_id"], plan["root"]
+    """전체 재스캔: 기존 파일 목록·배정·디스크(상태 포함)를 모두 지우고 처음부터 다시 만든다.
+    이미 구운 디스크가 있으면 add_folders()/allocate_new() 를 쓸 것."""
+    pid = plan["plan_id"]
     conn.execute("DELETE FROM file_info WHERE plan_id=?", (pid,))
     conn.execute("DELETE FROM assignment WHERE plan_id=?", (pid,))
     conn.execute("DELETE FROM disk WHERE plan_id=?", (pid,))
     conn.execute("DELETE FROM warning WHERE plan_id=?", (pid,))
-    total_files = total_bytes = 0
     folders = conn.execute("SELECT seq, folder_path FROM selected_folder WHERE plan_id=? ORDER BY seq",
                            (pid,)).fetchall()
+    total = _scan_folders(conn, plan, folders, progress)
+    _size_warnings(conn, plan)
+    return total
+
+
+def _scan_folders(conn, plan, folders, progress=None):
+    """folders: [(seq, 폴더명)] 을 읽어 file_info 에 추가. (파일수, 바이트) 반환."""
+    pid, root = plan["plan_id"], plan["root"]
+    total_files = total_bytes = 0
     for seq, folder in folders:
         stack = [os.path.join(root, folder)]
         batch = []
@@ -174,17 +184,115 @@ def scan(conn, plan, progress=None):
         conn.executemany("INSERT INTO file_info(plan_id, folder_seq, rel_path, size_bytes, mtime) "
                          "VALUES(?,?,?,?,?)", batch)
         conn.commit()
-    # 선경고: 0바이트, 디스크 용량 초과 파일(가장 큰 디스크 기준)
+    return total_files, total_bytes
+
+
+def _size_warnings(conn, plan, min_file_id=0):
+    """선경고: 0바이트, 디스크 용량 초과 파일(가장 큰 디스크 기준)."""
+    pid = plan["plan_id"]
     biggest = max_capacity(get_capacities(conn, plan), plan)
     for fid, rel, size in conn.execute(
-            "SELECT file_id, rel_path, size_bytes FROM file_info WHERE plan_id=? AND "
-            "(size_bytes=0 OR size_bytes>?)", (pid, biggest)).fetchall():
+            "SELECT file_id, rel_path, size_bytes FROM file_info WHERE plan_id=? AND file_id>? AND "
+            "(size_bytes=0 OR size_bytes>?)", (pid, min_file_id, biggest)).fetchall():
         if size == 0:
             _warn(conn, pid, fid, "zero", f"0바이트 파일: {rel}")
         else:
             _warn(conn, pid, fid, "oversize", f"디스크 용량 초과 ({size / GB:.1f} GB): {rel}")
     conn.commit()
-    return total_files, total_bytes
+
+
+# ---------------------------------------------------------------- incremental add
+def new_subfolders(conn, plan):
+    """원본 루트 아래 하부 폴더 중 아직 선택 목록(selected_folder)에 없는 것."""
+    have = {r[0] for r in conn.execute("SELECT folder_path FROM selected_folder WHERE plan_id=?",
+                                       (plan["plan_id"],))}
+    return [f for f in list_subfolders(plan["root"]) if f not in have]
+
+
+def add_folders(conn, plan, folders, progress=None):
+    """새 하위 폴더만 선택 목록 '끝'에 추가하고 그 폴더만 스캔한다.
+    기존 파일 목록·배정·디스크 상태는 건드리지 않는다. (추가된 폴더 수, 파일 수, 바이트) 반환."""
+    pid = plan["plan_id"]
+    have = {r[0] for r in conn.execute("SELECT folder_path FROM selected_folder WHERE plan_id=?", (pid,))}
+    todo = [f for f in folders if f not in have]
+    for f in todo:
+        if not os.path.isdir(os.path.join(plan["root"], f)):
+            raise SystemExit(f"폴더가 없습니다: {f}")
+    seq0 = conn.execute("SELECT COALESCE(MAX(seq),0) FROM selected_folder WHERE plan_id=?", (pid,)).fetchone()[0]
+    min_fid = conn.execute("SELECT COALESCE(MAX(file_id),0) FROM file_info").fetchone()[0]
+    new = [(seq0 + i + 1, f) for i, f in enumerate(todo)]
+    conn.executemany("INSERT INTO selected_folder VALUES(?,?,?)", [(pid, q, f) for q, f in new])
+    conn.commit()
+    n, b = _scan_folders(conn, plan, new, progress)
+    _size_warnings(conn, plan, min_fid)
+    return len(todo), n, b
+
+
+def allocate_new(conn, plan):
+    """아직 배정되지 않은 파일만 배정한다. (배정한 파일 수, 내용이 바뀐 디스크 번호 목록) 반환. 이미 구운 디스크('계획됨'이 아닌 것)는 절대 건드리지 않는다.
+    '계획됨' 디스크의 남는 공간을 번호순으로 먼저 채우고, 넘치면 새 디스크(마지막 번호+1…)를 만든다."""
+    pid, ovh, default = plan["plan_id"], plan["overhead"], plan["capacity"]
+    caps = get_capacities(conn, plan)
+
+    def cap_of(n):
+        return caps.get(n, default)
+
+    state = {}   # disk_no -> [used, count, order, status, is_new]
+    for no, used, cnt, st in conn.execute("SELECT disk_no, used_bytes, file_count, status FROM disk "
+                                          "WHERE plan_id=? ORDER BY disk_no", (pid,)):
+        order = conn.execute("SELECT COALESCE(MAX(order_in_disk),0) FROM assignment WHERE plan_id=? AND disk_no=?",
+                             (pid, no)).fetchone()[0]
+        state[no] = [used, cnt, order, st, False]
+    conn.execute("DELETE FROM warning WHERE plan_id=? AND kind='unassigned'", (pid,))
+
+    pending = conn.execute(
+        "SELECT f.file_id, f.rel_path, f.size_bytes, f.folder_seq FROM file_info f "
+        "LEFT JOIN assignment a ON a.plan_id=f.plan_id AND a.file_id=f.file_id "
+        "WHERE f.plan_id=? AND a.file_id IS NULL ORDER BY f.folder_seq", (pid,)).fetchall()
+    by_seq = {}
+    for r in pending:
+        by_seq.setdefault(r[3], []).append(r)
+    placed = 0
+    touched = set()
+    for seq in sorted(by_seq):
+        for fid, rel, size, _ in sorted(by_seq[seq], key=lambda r: natural_key(r[1])):
+            cost = size + ovh
+            target = next((n for n in sorted(state) if state[n][3] == STATUSES[0]
+                           and state[n][0] + cost <= cap_of(n)), None)
+            if target is None:
+                n = max(state, default=0) + 1
+                while cost > cap_of(n):                 # 용량이 모자란 번호는 건너뛰되, 담을 곳이 없으면 포기
+                    later = max([default] + [c for k, c in caps.items() if k > n])
+                    if cost > later:
+                        n = None
+                        break
+                    state[n] = [0, 0, 0, STATUSES[0], True]   # 빈 디스크로 남음(경고)
+                    n += 1
+                if n is None:
+                    _warn(conn, pid, fid, "unassigned",
+                          f"배정 불가(어느 디스크에도 들어가지 않음, {size / GB:.2f} GB): {rel}")
+                    continue
+                state[n] = [0, 0, 0, STATUSES[0], True]
+                target = n
+            st = state[target]
+            st[0] += cost
+            st[1] += 1
+            st[2] += 1
+            conn.execute("INSERT INTO assignment VALUES(?,?,?,?)", (pid, fid, target, st[2]))
+            placed += 1
+            touched.add(target)
+    for n, (used, cnt, _o, _st, is_new) in state.items():
+        if is_new:
+            conn.execute("INSERT INTO disk(plan_id, disk_no, disk_name, volume_label, used_bytes, file_count) "
+                         "VALUES(?,?,?,?,?,?)", (pid, n, f"disk{n:02d}", f"{plan['name']}_disk{n:02d}", used, cnt))
+            if cnt == 0:
+                _warn(conn, pid, None, "emptydisk",
+                      f"disk{n:02d}: 용량({cap_of(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
+        else:
+            conn.execute("UPDATE disk SET used_bytes=?, file_count=? WHERE plan_id=? AND disk_no=?",
+                         (used, cnt, pid, n))
+    conn.commit()
+    return placed, sorted(touched)
 
 
 def _warn(conn, pid, fid, kind, msg):
@@ -419,12 +527,16 @@ def main(argv=None):
     p = sub.add_parser("subfolders", help="원본 폴더의 하부 폴더 나열"); p.add_argument("name")
     p = sub.add_parser("select", help="백업 대상 폴더 목록(순서대로)")
     p.add_argument("name"); p.add_argument("folders", nargs="+")
-    p = sub.add_parser("scan", help="스캔 후 배정 계산"); p.add_argument("name")
+    p = sub.add_parser("scan", help="전체 스캔 후 배정 계산(기존 배정·상태 초기화)"); p.add_argument("name")
+    p.add_argument("--force", action="store_true", help="구운 디스크가 있어도 초기화하고 전체 재스캔")
     p = sub.add_parser("show", help="배정 결과"); p.add_argument("name")
     p = sub.add_parser("capacity", help="디스크별 용량 지정/조회 (예: capacity 계획 1=95 2=23.3 --binary)")
     p.add_argument("name"); p.add_argument("items", nargs="*", help="번호=용량  (용량 'default' 는 기본값으로)")
     p.add_argument("--binary", action="store_true", help="용량을 GiB(이진)로 해석")
     p.add_argument("--clear", action="store_true", help="지정을 모두 지우고 기본 용량으로")
+    p = sub.add_parser("add", help="새 하위 폴더만 추가 스캔·배정(구운 디스크는 그대로). 폴더 생략 시 새 폴더 전부")
+    p.add_argument("name"); p.add_argument("folders", nargs="*")
+    p.add_argument("--list", action="store_true", help="추가 대상 새 폴더만 나열")
     p = sub.add_parser("allocate", help="스캔 없이 현재 용량 설정으로 다시 배정")
     p.add_argument("name")
     p = sub.add_parser("export", help="하드링크 스테이징 + INDEX + CSV")
@@ -448,7 +560,30 @@ def main(argv=None):
             print(f)
     elif a.cmd == "select":
         set_folders(conn, plan, a.folders); print(f"{len(a.folders)}개 폴더 선택됨")
+    elif a.cmd == "add":
+        new = new_subfolders(conn, plan)
+        if a.list:
+            for f in new:
+                print(f)
+            print(f"새 폴더 {len(new)}개")
+            return
+        folders = a.folders or new
+        if not folders:
+            print("추가할 새 폴더가 없습니다.")
+            return
+        nf, n, b = add_folders(conn, plan, folders,
+                               lambda f, s: print(f"\r스캔 {f:,}개 {fmt(s)}", end="", file=sys.stderr))
+        placed, touched = allocate_new(conn, plan)
+        print(f"\n새 폴더 {nf}개, 파일 {n:,}개, {fmt(b)} → {placed:,}개 배정")
+        print("내용이 바뀐 디스크: " + (", ".join(f"disk{t:02d}" for t in touched) or "없음"))
+        print("※ 이 디스크들만 export 를 다시 실행하세요. 이미 구운 디스크는 변경되지 않았습니다.")
+        for kind, msg in conn.execute("SELECT kind, message FROM warning WHERE plan_id=? AND kind IN "
+                                      "('oversize','unassigned','emptydisk','access','zero')", (plan["plan_id"],)):
+            print(f"[경고:{kind}] {msg}")
     elif a.cmd == "scan":
+        if locked_disks(conn, plan) and not a.force:
+            raise SystemExit("이미 구운(또는 굽는 중) 디스크가 있어 전체 재스캔은 상태·배정을 모두 초기화합니다.\n"
+                             "새 폴더만 추가하려면 'add' 를 쓰세요. 정말 초기화하려면 --force.")
         n, b = scan(conn, plan, lambda f, s: print(f"\r스캔 {f:,}개 {fmt(s)}", end="", file=sys.stderr))
         print(f"\n파일 {n:,}개, {fmt(b)}")
         dec, bi = estimate_disks(b, plan["capacity"])

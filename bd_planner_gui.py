@@ -78,7 +78,9 @@ class App(tk.Tk):
         self.sum_var = tk.StringVar(value="폴더 목록을 읽어 주세요.")
         ttk.Label(left, textvariable=self.sum_var, foreground="#555").pack(anchor="w", padx=6, pady=(0, 4))
         self.scan_btn = ttk.Button(left, text="③ 스캔 + 배정 계산", command=self.run_scan)
-        self.scan_btn.pack(fill="x", padx=6, pady=(0, 6))
+        self.scan_btn.pack(fill="x", padx=6, pady=(0, 2))
+        self.add_btn = ttk.Button(left, text="③' 새 폴더만 추가 배정 (구운 디스크 유지)", command=self.run_add)
+        self.add_btn.pack(fill="x", padx=6, pady=(0, 6))
 
         right = ttk.LabelFrame(body, text="④ 디스크 배정 결과")
         body.add(right, weight=2)
@@ -244,10 +246,13 @@ class App(tk.Tk):
             "LEFT JOIN file_info f ON f.plan_id=sf.plan_id AND f.folder_seq=sf.seq "
             "WHERE sf.plan_id=? GROUP BY sf.seq", (plan["plan_id"],))}
         self.ftree.delete(*self.ftree.get_children())
+        scanned = bool(self.conn.execute("SELECT 1 FROM file_info WHERE plan_id=? LIMIT 1",
+                                         (plan["plan_id"],)).fetchone())
         for f in [s for s in saved if s in subs] + [s for s in subs if s not in saved]:
             cnt, size = stats.get(f, (None, None))
             self.ftree.insert("", "end", values=(CHECK if f in saved else UNCHECK, "", f,
-                                                 f"{cnt:,}" if cnt else "", core.fmt(size) if size else ""))
+                                                 f"{cnt:,}" if cnt else ("신규" if scanned and f not in saved else ""),
+                                                 core.fmt(size) if size else ""))
         self.renumber()
         self.sync_caps_entry()
         self.refresh_disks()
@@ -350,6 +355,14 @@ class App(tk.Tk):
             if str(e) != "취소됨":
                 messagebox.showerror("오류", str(e))
             return
+        locked = core.locked_disks(self.conn, plan)
+        if locked and not messagebox.askyesno(
+                "전체 재스캔 경고",
+                "이미 구운(또는 굽는 중) 디스크가 있습니다: " + ", ".join(f"disk{n:02d}" for n in locked) +
+                "\n\n전체 재스캔은 모든 배정과 디스크 상태를 초기화하며, 구운 디스크와 구성이 달라질 수 있습니다.\n"
+                "새 폴더만 추가하려면 '새 폴더만 추가 배정'을 쓰세요.\n\n그래도 전체 재스캔할까요?",
+                default="no", icon="warning"):
+            return
         core.set_folders(self.conn, plan, names)
         try:
             core.set_capacities(self.conn, plan, self.parse_caps())   # 입력칸 = 디스크별 용량(스캔 시 저장)
@@ -379,6 +392,49 @@ class App(tk.Tk):
                 messagebox.showwarning("경고", f"경고 {len(over)}건이 있습니다. 아래 로그를 확인하세요.\n"
                                        "(용량 초과 파일은 배정에서 제외됩니다.)")
         self.run_bg(fn, done, "스캔 중…")
+
+    def run_add(self):
+        """체크된 폴더 중 아직 계획에 없는 '새 폴더'만 스캔해 남는 공간·새 디스크에 배정."""
+        try:
+            plan = self.ensure_plan()
+        except ValueError as e:
+            if str(e) != "취소됨":
+                messagebox.showerror("오류", str(e))
+            return
+        if not self.conn.execute("SELECT 1 FROM disk WHERE plan_id=? LIMIT 1", (plan["plan_id"],)).fetchone():
+            messagebox.showinfo("확인", "아직 배정 결과가 없습니다. 처음에는 '스캔 + 배정 계산'을 사용하세요.")
+            return
+        have = {r[0] for r in self.conn.execute("SELECT folder_path FROM selected_folder WHERE plan_id=?",
+                                                (plan["plan_id"],))}
+        new = [f for f in self.checked() if f not in have]
+        if not new:
+            messagebox.showinfo("새 폴더 없음", "목록에서 '신규' 폴더를 ☑ 체크한 뒤 눌러 주세요.\n"
+                                "(먼저 [폴더 목록 읽기]로 원본의 새 폴더를 불러옵니다.)")
+            return
+        try:
+            core.set_capacities(self.conn, plan, self.parse_caps())
+        except ValueError as e:
+            messagebox.showerror("오류", str(e))
+            return
+
+        def fn(conn):
+            p = core.get_plan(conn, plan["name"])
+            nf, n, b = core.add_folders(conn, p, new,
+                                        lambda f, s: self.q.put(("prog", None, f"새 폴더 스캔 중… {f:,}개 / {core.fmt(s)}")))
+            placed, touched = core.allocate_new(conn, p)
+            return nf, n, b, placed, touched
+
+        def done(res):
+            nf, n, b, placed, touched = res
+            self.say(f"새 폴더 {nf}개 · 파일 {n:,}개 · {core.fmt(b)} → {placed:,}개 배정")
+            self.say("내용이 바뀐 디스크: " + (", ".join(f"disk{t:02d}" for t in touched) or "없음") +
+                     "  ← 이 디스크만 다시 내보내기(export). 구운 디스크는 변경 없음.")
+            for (m,) in self.conn.execute("SELECT message FROM warning WHERE plan_id=? AND kind IN "
+                                          "('oversize','unassigned','emptydisk','access')", (plan["plan_id"],)):
+                self.say(f"[경고] {m}")
+            self.load_folders()
+            self.dtree.selection_set([str(t) for t in touched if self.dtree.exists(str(t))])
+        self.run_bg(fn, done, "새 폴더 추가 중…")
 
     # ------------------------------------------------------------ disks view
     def refresh_disks(self):
