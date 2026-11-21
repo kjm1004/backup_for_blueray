@@ -13,6 +13,7 @@ import bd_planner as core  # noqa: E402
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bd_planner.db")
 CHECK, UNCHECK = "☑", "☐"
+NO_MEDIA = "(없음: 위 숫자 사용)"
 
 
 class App(tk.Tk):
@@ -52,6 +53,13 @@ class App(tk.Tk):
         ttk.Label(top, text="※ 파일 1개마다 용량에 더해 계산(UDF 메타데이터·섹터 올림 보정). 0이면 사용 안 함.",
                   foreground="#555").grid(row=1, column=0, columnspan=5, sticky="w", **pad)
         ttk.Button(top, text="폴더 목록 읽기", command=self.load_folders).grid(row=0, column=8, **pad)
+        ttk.Label(top, text="기본 미디어").grid(row=3, column=0, **pad)
+        self.defmedia_var = tk.StringVar(value=NO_MEDIA)
+        self.defmedia_cb = ttk.Combobox(top, textvariable=self.defmedia_var, width=30, state="readonly")
+        self.defmedia_cb.grid(row=3, column=1, columnspan=4, sticky="we", **pad)
+        ttk.Button(top, text="미디어 종류 설정…", command=self.edit_media_types).grid(row=3, column=5, columnspan=2, **pad)
+        ttk.Label(top, text="※ 지정 없는 디스크는 이 미디어(100G/50G/25G)의 용량·오버헤드를 씁니다. '(없음)'이면 위 숫자(디스크 용량·오버헤드)를 사용.",
+                  foreground="#555").grid(row=4, column=0, columnspan=9, sticky="w", **pad)
         ttk.Label(top, text="디스크별 용량").grid(row=2, column=0, **pad)
         self.caps_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.caps_var, width=34).grid(row=2, column=1, columnspan=4, sticky="we", **pad)
@@ -85,9 +93,10 @@ class App(tk.Tk):
 
         right = ttk.LabelFrame(body, text="④ 디스크 배정 결과")
         body.add(right, weight=2)
-        self.dtree = ttk.Treeview(right, columns=("disk", "st", "cap", "used", "pct", "cnt", "copy", "ver", "folders"),
+        self.dtree = ttk.Treeview(right, columns=("disk", "st", "media", "cap", "used", "pct", "cnt", "copy", "ver", "folders"),
                                   show="headings", selectmode="extended", height=12)
-        for c, t, w, a in (("disk", "디스크", 70, "w"), ("st", "상태", 70, "w"), ("cap", "용량(GB)", 80, "e"),
+        for c, t, w, a in (("disk", "디스크", 70, "w"), ("st", "상태", 70, "w"), ("media", "미디어", 100, "w"),
+                           ("cap", "용량(GB)", 80, "e"),
                            ("used", "사용(GB)", 80, "e"),
                            ("pct", "채움", 55, "e"), ("cnt", "파일수", 70, "e"), ("copy", "사본", 45, "e"),
                            ("ver", "최근 검증", 120, "w"), ("folders", "포함 폴더", 300, "w")):
@@ -118,6 +127,18 @@ class App(tk.Tk):
         ttk.Button(cap, text="기본 용량으로", command=lambda: self.apply_disk_capacity(reset=True)).pack(side="left")
         ttk.Button(cap, text="재배정", command=self.run_realloc).pack(side="left", padx=12)
 
+        md = ttk.Frame(right)
+        md.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(md, text="선택 디스크 미디어:").pack(side="left")
+        self.media_var = tk.StringVar()
+        self.media_cb = ttk.Combobox(md, textvariable=self.media_var, width=16, state="readonly")
+        self.media_cb.pack(side="left", padx=4)
+        ttk.Button(md, text="적용 후 재배정", command=self.apply_media).pack(side="left")
+        ttk.Button(md, text="선택 번호~끝까지", command=lambda: self.apply_media(to_end=True)).pack(side="left", padx=4)
+        ttk.Button(md, text="해제", command=lambda: self.apply_media(clear=True)).pack(side="left")
+        self.media_info = tk.StringVar()
+        ttk.Label(md, textvariable=self.media_info, foreground="#555").pack(side="left", padx=8)
+
         hv = ttk.Frame(right)
         hv.pack(fill="x", padx=4, pady=(4, 0))
         ttk.Label(hv, text="이력·검증:").pack(side="left")
@@ -136,6 +157,7 @@ class App(tk.Tk):
         ttk.Label(out, text="※ 스테이징은 원본과 같은 NTFS 드라이브여야 합니다(하드링크, 용량 미사용).",
                   foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
+        self.refresh_media_widgets()
         self.log = tk.Text(right, height=9, wrap="word")
         self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.status = tk.StringVar(value="준비")
@@ -264,6 +286,7 @@ class App(tk.Tk):
                                                  core.fmt(size) if size else ""))
         self.renumber()
         self.sync_caps_entry()
+        self.sync_default_media()
         self.refresh_disks()
         self.say(f"원본: {plan['root']}  (하부 폴더 {len(subs)}개)")
 
@@ -375,6 +398,7 @@ class App(tk.Tk):
         core.set_folders(self.conn, plan, names)
         try:
             core.set_capacities(self.conn, plan, self.parse_caps())   # 입력칸 = 디스크별 용량(스캔 시 저장)
+            self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
             return
@@ -422,6 +446,7 @@ class App(tk.Tk):
             return
         try:
             core.set_capacities(self.conn, plan, self.parse_caps())
+            self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
             return
@@ -454,7 +479,7 @@ class App(tk.Tk):
             return
         plan = self.plan
         split = dict(core.split_folders(self.conn, plan))
-        caps = core.get_capacities(self.conn, plan)
+        sp = core.Specs(self.conn, plan)
         recs = {}
         for r in core.burn_records(self.conn, plan):
             recs.setdefault(r[1], []).append(r)
@@ -464,9 +489,9 @@ class App(tk.Tk):
             parts = []
             for folder, c, size in core.disk_folders(self.conn, plan, no):
                 parts.append(f"{folder} {size / core.GB:.1f}G" + ("◀▶" if folder in split else ""))
-            cap = core.capacity_of(caps, plan, no)
+            cap = sp.cap(no)
             self.dtree.insert("", "end", iid=str(no), tags=(st,), values=(
-                name, st, f"{cap / core.GB:.2f}" + ("*" if no in caps else ""),
+                name, st, sp.media_label(no), f"{cap / core.GB:.2f}" + ("*" if no in sp.custom else ""),
                 f"{used / core.GB:.2f}", f"{used * 100 / cap:.0f}%", f"{cnt:,}",
                 len(recs.get(no, [])) or "", self.last_verify(recs.get(no, [])),
                 " · ".join(parts)))
@@ -477,9 +502,115 @@ class App(tk.Tk):
     def on_disk_select(self, _ev):
         sel = self.selected_disks()
         if len(sel) == 1 and self.plan:
-            cap = core.capacity_of(core.get_capacities(self.conn, self.plan), self.plan, sel[0])
-            v = cap / self.unit_bytes()
-            self.cap_one_var.set(f"{v:.6g}")
+            sp = core.Specs(self.conn, self.plan)
+            self.cap_one_var.set(f"{sp.cap(sel[0]) / self.unit_bytes():.6g}")
+            self.media_var.set(sp.media_label(sel[0]))
+            self.media_info.set(f"사용 가능 {core.fmt(sp.cap(sel[0]))} · 파일당 오버헤드 {sp.ovh(sel[0]):,}B")
+
+    # ------------------------------------------------------------ media types
+    def media_pairs(self):
+        return [(k, t["label"]) for k, t in core.media_types(self.conn).items()]
+
+    def key_of_label(self, label):
+        return next((k for k, lb in self.media_pairs() if lb == label), None)
+
+    def refresh_media_widgets(self):
+        labels = [lb for _k, lb in self.media_pairs()]
+        self.defmedia_cb.configure(values=[NO_MEDIA] + labels)
+        self.media_cb.configure(values=labels)
+        if self.defmedia_var.get() not in [NO_MEDIA] + labels:
+            self.defmedia_var.set(NO_MEDIA)
+
+    def sync_default_media(self):
+        """DB 의 기본 미디어를 콤보박스에 반영."""
+        if not self.plan:
+            return
+        k = core.get_setting(self.conn, self.plan, "default_media")
+        types = core.media_types(self.conn)
+        self.defmedia_var.set(types[k]["label"] if k in types else NO_MEDIA)
+
+    def save_default_media(self):
+        core.set_default_media(self.conn, self.plan, self.key_of_label(self.defmedia_var.get()))
+
+    def apply_media(self, to_end=False, clear=False):
+        """선택 디스크(들)에 미디어 종류를 지정하고, 그 종류의 용량·오버헤드로 재배정."""
+        nos = self.selected_disks()
+        if not nos or not self.plan:
+            messagebox.showinfo("선택 없음", "미디어를 지정할 디스크를 선택하세요.")
+            return
+        key = None
+        if not clear:
+            key = self.key_of_label(self.media_var.get())
+            if not key:
+                messagebox.showinfo("확인", "미디어 종류(100G/50G/25G)를 고르세요.")
+                return
+        if to_end:
+            nos = list(range(min(nos), max(int(i) for i in self.dtree.get_children()) + 1))
+        core.assign_media(self.conn, self.plan, nos, key)
+        self.sync_caps_entry()
+        self.say(("미디어 지정 해제: " if clear else f"미디어 {self.media_var.get()} 지정: ") +
+                 ", ".join(f"disk{n:02d}" for n in nos))
+        self.run_realloc(changed=min(nos))
+
+    def edit_media_types(self):
+        win = tk.Toplevel(self)
+        win.title("미디어 종류 설정 (모든 계획 공통)")
+        win.transient(self)
+        win.grab_set()
+        tv = ttk.Treeview(win, show="headings", height=4, selectmode="browse",
+                          columns=("key", "label", "cap", "pf", "fx"))
+        for c, t, w, a in (("key", "키", 60, "w"), ("label", "이름", 140, "w"), ("cap", "기록 가능 용량(B)", 150, "e"),
+                           ("pf", "파일당 오버헤드(B)", 130, "e"), ("fx", "디스크당 고정(MB)", 120, "e")):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor=a)
+        tv.pack(fill="x", padx=8, pady=8)
+
+        def fill():
+            tv.delete(*tv.get_children())
+            for k, t in core.media_types(self.conn).items():
+                tv.insert("", "end", iid=k, values=(k, t["label"], f"{t['capacity']:,}", f"{t['per_file']:,}",
+                                                    f"{t['fixed'] / 1_000_000:.1f}"))
+        fill()
+
+        def edit():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo("선택 없음", "수정할 종류를 선택하세요.", parent=win)
+                return
+            k = sel[0]
+            t = core.media_types(self.conn)[k]
+            f = self.form(f"{k} 수정", [("label", "이름"), ("cap", "기록 가능 용량(바이트)"),
+                                        ("pf", "파일당 오버헤드(바이트)"), ("fx", "디스크당 고정 오버헤드(MB)")],
+                          {"label": t["label"], "cap": str(t["capacity"]), "pf": str(t["per_file"]),
+                           "fx": f"{t['fixed'] / 1_000_000:.6g}"})
+            if not f:
+                return
+            try:
+                core.set_media_type(self.conn, k, capacity=int(f["cap"].replace(",", "")),
+                                    per_file=int(f["pf"].replace(",", "")),
+                                    fixed=int(float(f["fx"]) * 1_000_000), label=f["label"] or None)
+            except (ValueError, SystemExit) as e:
+                messagebox.showerror("오류", str(e) or "숫자를 확인하세요.", parent=win)
+                return
+            fill()
+            self.refresh_media_widgets()
+            self.refresh_disks()
+
+        def reset():
+            if messagebox.askyesno("기본값 복원", "100G/50G/25G 설정을 기본값으로 되돌릴까요?", parent=win):
+                core.reset_media_types(self.conn)
+                fill()
+                self.refresh_media_widgets()
+                self.refresh_disks()
+        bf = ttk.Frame(win)
+        bf.pack(pady=(0, 6))
+        ttk.Button(bf, text="수정…", command=edit).pack(side="left", padx=6)
+        ttk.Button(bf, text="기본값 복원", command=reset).pack(side="left", padx=6)
+        ttk.Button(bf, text="닫기", command=win.destroy).pack(side="left", padx=6)
+        ttk.Label(win, foreground="#555", wraplength=520, text=(
+            "※ 기록 가능 용량은 드라이브가 보고하는 Free Space(바이트)입니다. 오버헤드는 UDF 메타데이터·섹터 올림 보정용으로 "
+            "파일마다 더하는 값(파일당)과 디스크마다 빼 두는 값(고정)이 있습니다. 바꾼 값은 [재배정] 후 반영됩니다.")
+        ).pack(padx=8, pady=(0, 8))
 
     # ------------------------------------------------------------ per-disk capacity
     def apply_disk_capacity(self, reset=False):
@@ -510,6 +641,7 @@ class App(tk.Tk):
             return
         try:
             core.set_capacities(self.conn, plan, self.parse_caps())
+            self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
             return

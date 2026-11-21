@@ -41,16 +41,34 @@ CREATE TABLE IF NOT EXISTS disk_history(
 CREATE TABLE IF NOT EXISTS burn_record(
   rec_id INTEGER PRIMARY KEY, plan_id INTEGER, disk_no INTEGER, copy_no INTEGER,
   media_id TEXT, location TEXT, burned_at TEXT, verified_at TEXT, verify_result TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS media_type(
+  key TEXT PRIMARY KEY, label TEXT, capacity_bytes INTEGER, per_file_overhead INTEGER,
+  fixed_overhead INTEGER, sort INTEGER);
+CREATE TABLE IF NOT EXISTS disk_media(
+  plan_id INTEGER, disk_no INTEGER, media_key TEXT, PRIMARY KEY(plan_id, disk_no));
+CREATE TABLE IF NOT EXISTS plan_setting(
+  plan_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(plan_id, key));
 CREATE TABLE IF NOT EXISTS disk_capacity(
   plan_id INTEGER, disk_no INTEGER, capacity_bytes INTEGER, PRIMARY KEY(plan_id, disk_no));
 """
 
 STATUSES = ["계획됨", "굽는 중", "완료", "검증됨"]
 
+# 미디어 종류 기본값: (key, 라벨, 기록 가능 용량(바이트: 드라이브가 보고하는 Free Space), 파일당 오버헤드, 고정 오버헤드)
+# 100GB = 48,878,592 섹터 × 2048,  50GB = 24,438,784 섹터,  25GB = 12,219,392 섹터
+DEFAULT_MEDIA = [
+    ("BD100", "BD-R XL 100GB", 100_103_356_416, 4096, 64 * 1024 * 1024),
+    ("BD50", "BD-R DL 50GB", 50_050_629_632, 4096, 64 * 1024 * 1024),
+    ("BD25", "BD-R 25GB", 25_025_314_816, 4096, 64 * 1024 * 1024),
+]
+
 
 def connect(db_path):
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    for i, (key, label, cap, per_file, fixed) in enumerate(DEFAULT_MEDIA):
+        conn.execute("INSERT OR IGNORE INTO media_type VALUES(?,?,?,?,?,?)", (key, label, cap, per_file, fixed, i))
+    conn.commit()
     return conn
 
 
@@ -116,6 +134,121 @@ def set_capacities(conn, plan, values):
 
 def max_capacity(caps, plan):
     return max([plan["capacity"], *caps.values()])
+
+
+# ---------------------------------------------------------------- media types
+def media_types(conn):
+    """{key: {label, capacity, per_file, fixed}} (정렬 순서 유지)"""
+    return {r[0]: {"label": r[1], "capacity": r[2], "per_file": r[3], "fixed": r[4]}
+            for r in conn.execute("SELECT key, label, capacity_bytes, per_file_overhead, fixed_overhead "
+                                  "FROM media_type ORDER BY sort, key")}
+
+
+def set_media_type(conn, key, capacity=None, per_file=None, fixed=None, label=None):
+    """미디어 종류의 값을 바꾼다(None 은 유지). 용량·오버헤드는 바이트."""
+    if key not in media_types(conn):
+        raise SystemExit(f"알 수 없는 미디어 종류: {key}")
+    for col, v in (("capacity_bytes", capacity), ("per_file_overhead", per_file),
+                   ("fixed_overhead", fixed), ("label", label)):
+        if v is None:
+            continue
+        if col != "label" and v < 0:
+            raise SystemExit("용량과 오버헤드는 0 이상이어야 합니다.")
+        if col == "capacity_bytes" and v <= 0:
+            raise SystemExit("미디어 용량은 0보다 커야 합니다.")
+        conn.execute(f"UPDATE media_type SET {col}=? WHERE key=?", (v, key))
+    conn.commit()
+
+
+def reset_media_types(conn):
+    for i, (key, label, cap, per_file, fixed) in enumerate(DEFAULT_MEDIA):
+        conn.execute("INSERT OR REPLACE INTO media_type VALUES(?,?,?,?,?,?)", (key, label, cap, per_file, fixed, i))
+    conn.commit()
+
+
+def get_setting(conn, plan, key, default=None):
+    r = conn.execute("SELECT value FROM plan_setting WHERE plan_id=? AND key=?", (plan["plan_id"], key)).fetchone()
+    return r[0] if r else default
+
+
+def set_setting(conn, plan, key, value):
+    if value is None:
+        conn.execute("DELETE FROM plan_setting WHERE plan_id=? AND key=?", (plan["plan_id"], key))
+    else:
+        conn.execute("INSERT OR REPLACE INTO plan_setting VALUES(?,?,?)", (plan["plan_id"], key, value))
+    conn.commit()
+
+
+def get_disk_media(conn, plan):
+    return dict(conn.execute("SELECT disk_no, media_key FROM disk_media WHERE plan_id=?",
+                             (plan["plan_id"],)).fetchall())
+
+
+def set_default_media(conn, plan, key):
+    """지정이 없는 디스크에 쓸 기본 미디어 종류. None 이면 계획의 '디스크 용량'·'파일당 오버헤드' 숫자를 쓴다."""
+    if key is not None and key not in media_types(conn):
+        raise SystemExit(f"알 수 없는 미디어 종류: {key}")
+    set_setting(conn, plan, "default_media", key)
+
+
+def assign_media(conn, plan, disk_nos, key):
+    """디스크별 미디어 종류 지정(key=None 이면 지정 해제 → 기본값). 같은 디스크의 '직접 지정 용량'은 지운다."""
+    if key is not None and key not in media_types(conn):
+        raise SystemExit(f"알 수 없는 미디어 종류: {key}")
+    pid = plan["plan_id"]
+    for n in disk_nos:
+        if key is None:
+            conn.execute("DELETE FROM disk_media WHERE plan_id=? AND disk_no=?", (pid, n))
+        else:
+            conn.execute("INSERT OR REPLACE INTO disk_media VALUES(?,?,?)", (pid, n, key))
+            conn.execute("DELETE FROM disk_capacity WHERE plan_id=? AND disk_no=?", (pid, n))
+    conn.commit()
+
+
+class Specs:
+    """디스크 번호별 (사용 가능 용량, 파일당 오버헤드)를 한곳에서 결정한다.
+    용량: 직접 지정(disk_capacity) > 지정한 미디어 종류(용량 - 고정 오버헤드) > 기본 미디어 > 계획 숫자.
+    파일당 오버헤드: 지정/기본 미디어 종류의 값 > 계획 숫자."""
+
+    def __init__(self, conn, plan):
+        self.plan = plan
+        self.custom = get_capacities(conn, plan)
+        self.media = get_disk_media(conn, plan)
+        self.types = media_types(conn)
+        dm = get_setting(conn, plan, "default_media")
+        self.default_media = dm if dm in self.types else None
+        self.explicit = sorted(set(self.custom) | set(self.media))
+        self.far = max(self.explicit, default=0) + 1000      # '지정 없는 디스크'를 대표하는 번호
+
+    def media_key(self, n):
+        k = self.media.get(n, self.default_media)
+        return k if k in self.types else None
+
+    def media_label(self, n):
+        k = self.media_key(n)
+        return self.types[k]["label"] if k else ""
+
+    def cap(self, n):
+        if n in self.custom:
+            return self.custom[n]
+        k = self.media_key(n)
+        if k:
+            t = self.types[k]
+            return max(t["capacity"] - t["fixed"], 0)
+        return self.plan["capacity"]
+
+    def ovh(self, n):
+        k = self.media_key(n)
+        return self.types[k]["per_file"] if k else self.plan["overhead"]
+
+    def fits_later(self, n, size):
+        """번호가 n 보다 큰 디스크 중(지정 디스크 + 기본 설정 디스크) 이 파일이 들어가는 곳이 있는가."""
+        cands = [k for k in self.explicit if k > n] + [max(n, self.far)]
+        return any(size + self.ovh(k) <= self.cap(k) for k in cands)
+
+    def max_file_size(self):
+        """어느 디스크에든 들어갈 수 있는 가장 큰 파일 크기."""
+        return max(self.cap(k) - self.ovh(k) for k in self.explicit + [self.far])
 
 
 def create_plan(conn, name, root, capacity=DEFAULT_CAPACITY, overhead=0):
@@ -196,7 +329,7 @@ def _scan_folders(conn, plan, folders, progress=None):
 def _size_warnings(conn, plan, min_file_id=0):
     """선경고: 0바이트, 디스크 용량 초과 파일(가장 큰 디스크 기준)."""
     pid = plan["plan_id"]
-    biggest = max_capacity(get_capacities(conn, plan), plan)
+    biggest = Specs(conn, plan).max_file_size()
     for fid, rel, size in conn.execute(
             "SELECT file_id, rel_path, size_bytes FROM file_info WHERE plan_id=? AND file_id>? AND "
             "(size_bytes=0 OR size_bytes>?)", (pid, min_file_id, biggest)).fetchall():
@@ -237,12 +370,8 @@ def add_folders(conn, plan, folders, progress=None):
 def allocate_new(conn, plan):
     """아직 배정되지 않은 파일만 배정한다. (배정한 파일 수, 내용이 바뀐 디스크 번호 목록) 반환. 이미 구운 디스크('계획됨'이 아닌 것)는 절대 건드리지 않는다.
     '계획됨' 디스크의 남는 공간을 번호순으로 먼저 채우고, 넘치면 새 디스크(마지막 번호+1…)를 만든다."""
-    pid, ovh, default = plan["plan_id"], plan["overhead"], plan["capacity"]
-    caps = get_capacities(conn, plan)
-
-    def cap_of(n):
-        return caps.get(n, default)
-
+    pid = plan["plan_id"]
+    sp = Specs(conn, plan)
     state = {}   # disk_no -> [used, count, order, status, is_new]
     for no, used, cnt, st in conn.execute("SELECT disk_no, used_bytes, file_count, status FROM disk "
                                           "WHERE plan_id=? ORDER BY disk_no", (pid,)):
@@ -262,14 +391,12 @@ def allocate_new(conn, plan):
     touched = set()
     for seq in sorted(by_seq):
         for fid, rel, size, _ in sorted(by_seq[seq], key=lambda r: natural_key(r[1])):
-            cost = size + ovh
             target = next((n for n in sorted(state) if state[n][3] == STATUSES[0]
-                           and state[n][0] + cost <= cap_of(n)), None)
+                           and state[n][0] + size + sp.ovh(n) <= sp.cap(n)), None)
             if target is None:
                 n = max(state, default=0) + 1
-                while cost > cap_of(n):                 # 용량이 모자란 번호는 건너뛰되, 담을 곳이 없으면 포기
-                    later = max([default] + [c for k, c in caps.items() if k > n])
-                    if cost > later:
+                while size + sp.ovh(n) > sp.cap(n):     # 용량이 모자란 번호는 건너뛰되, 담을 곳이 없으면 포기
+                    if not sp.fits_later(n, size):
                         n = None
                         break
                     state[n] = [0, 0, 0, STATUSES[0], True]   # 빈 디스크로 남음(경고)
@@ -281,7 +408,7 @@ def allocate_new(conn, plan):
                 state[n] = [0, 0, 0, STATUSES[0], True]
                 target = n
             st = state[target]
-            st[0] += cost
+            st[0] += size + sp.ovh(target)
             st[1] += 1
             st[2] += 1
             conn.execute("INSERT INTO assignment VALUES(?,?,?,?)", (pid, fid, target, st[2]))
@@ -293,7 +420,7 @@ def allocate_new(conn, plan):
                          "VALUES(?,?,?,?,?,?)", (pid, n, f"disk{n:02d}", f"{plan['name']}_disk{n:02d}", used, cnt))
             if cnt == 0:
                 _warn(conn, pid, None, "emptydisk",
-                      f"disk{n:02d}: 용량({cap_of(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
+                      f"disk{n:02d}: 용량({sp.cap(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
         else:
             conn.execute("UPDATE disk SET used_bytes=?, file_count=? WHERE plan_id=? AND disk_no=?",
                          (used, cnt, pid, n))
@@ -319,9 +446,8 @@ def allocate(conn, plan):
     """목록 순서 → 폴더 내 경로 자연정렬 순으로 디스크를 채움. 파일은 쪼개지 않음.
     디스크마다 용량이 다를 수 있다(disk_capacity). 지정이 없는 디스크는 계획 기본 용량.
     재배정 시 구성이 그대로인 디스크는 상태(완료/검증됨 등)를 유지하고, 바뀐 디스크만 '계획됨'으로 초기화한다."""
-    pid, ovh = plan["plan_id"], plan["overhead"]
-    caps = get_capacities(conn, plan)
-    default = plan["capacity"]
+    pid = plan["plan_id"]
+    sp = Specs(conn, plan)
 
     # 이전 배정 스냅샷(상태 보존용)
     old_members = {}
@@ -338,9 +464,6 @@ def allocate(conn, plan):
     disk_no = used = count = order = 0
     disks, members = {}, {}
 
-    def cap_of(n):
-        return caps.get(n, default)
-
     def open_disk():
         nonlocal disk_no, used, count, order
         if disk_no:
@@ -354,19 +477,17 @@ def allocate(conn, plan):
                              "WHERE plan_id=? AND folder_seq=?", (pid, seq)).fetchall()
         files.sort(key=lambda r: natural_key(r[1]))
         for fid, rel, size in files:
-            cost = size + ovh
             if disk_no == 0:
                 open_disk()
-            while used + cost > cap_of(disk_no):
+            while used + size + sp.ovh(disk_no) > sp.cap(disk_no):
                 # 이후 디스크(번호가 더 큰 것) 중 이 파일을 담을 수 있는 곳이 있어야 계속 진행
-                later = max([default] + [c for n, c in caps.items() if n > disk_no])
-                if cost > later:
+                if not sp.fits_later(disk_no, size):
                     _warn(conn, pid, fid, "unassigned",
                           f"배정 불가(어느 디스크에도 들어가지 않음, {size / GB:.2f} GB): {rel}")
                     break
                 open_disk()
             else:
-                used += cost
+                used += size + sp.ovh(disk_no)
                 count += 1
                 order += 1
                 members[disk_no].append(fid)
@@ -379,7 +500,7 @@ def allocate(conn, plan):
                      "VALUES(?,?,?,?,?,?)", (pid, n, f"disk{n:02d}", f"{plan['name']}_disk{n:02d}", u, c))
         if c == 0:
             _warn(conn, pid, None, "emptydisk",
-                  f"disk{n:02d}: 용량({cap_of(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
+                  f"disk{n:02d}: 용량({sp.cap(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
         prev = old_state.get(n)
         if prev and prev[0] != STATUSES[0]:
             if old_members.get(n) == members.get(n):      # 구성 동일 → 상태 유지
@@ -650,8 +771,10 @@ def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None):
                        (plan["plan_id"], disk_no)).fetchone()
     split = {f: d for f, d in split_folders(conn, plan)}
     with open(os.path.join(dest, "INDEX.txt"), "w", encoding="utf-8-sig") as fh:
-        cap = capacity_of(get_capacities(conn, plan), plan, disk_no)
-        fh.write(f"{row[0]}  ({name})\n파일 {row[2]:,}개 / {row[1] / GB:.2f} GB (디스크 용량 기준 {cap / GB:.2f} GB)\n\n[포함 폴더]\n")
+        sp = Specs(conn, plan)
+        kind = f", {sp.media_label(disk_no)}" if sp.media_label(disk_no) else ""
+        fh.write(f"{row[0]}  ({name})\n파일 {row[2]:,}개 / {row[1] / GB:.2f} GB "
+                 f"(사용 가능 용량 기준 {sp.cap(disk_no) / GB:.2f} GB{kind})\n\n[포함 폴더]\n")
         for folder, cnt, size in disk_folders(conn, plan, disk_no):
             mark = f"  ※ 분할 폴더(디스크 {split[folder]} 에 나뉨)" if folder in split else ""
             fh.write(f"- {folder}  {cnt:,}개  {size / GB:.2f} GB{mark}\n")
@@ -696,11 +819,10 @@ def cmd_show(conn, plan):
     rows = conn.execute("SELECT disk_no, disk_name, used_bytes, file_count, status FROM disk "
                         "WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],)).fetchall()
     split = dict(split_folders(conn, plan))
-    caps = get_capacities(conn, plan)
+    sp = Specs(conn, plan)
     for no, name, used, cnt, st in rows:
-        cap = capacity_of(caps, plan, no)
-        mark = "" if no not in caps else " (지정)"
-        print(f"{name} [{st}] {fmt(used)} / {fmt(cap)}{mark}  파일 {cnt:,}")
+        mark = f" ({sp.media_label(no)})" if sp.media_label(no) else (" (직접 지정)" if no in sp.custom else "")
+        print(f"{name} [{st}] {fmt(used)} / {fmt(sp.cap(no))}{mark}  파일 {cnt:,}")
         for folder, c, size in disk_folders(conn, plan, no):
             mark = f"  (분할: 디스크 {split[folder]})" if folder in split else ""
             print(f"    {folder}  {c:,}개  {fmt(size)}{mark}")
@@ -730,6 +852,18 @@ def main(argv=None):
     p = sub.add_parser("add", help="새 하위 폴더만 추가 스캔·배정(구운 디스크는 그대로). 폴더 생략 시 새 폴더 전부")
     p.add_argument("name"); p.add_argument("folders", nargs="*")
     p.add_argument("--list", action="store_true", help="추가 대상 새 폴더만 나열")
+    p = sub.add_parser("mediatypes", help="미디어 종류(100G/50G/25G)의 용량·오버헤드 조회/수정 (모든 계획 공통)")
+    p.add_argument("--set", metavar="KEY", help="수정할 종류(BD100/BD50/BD25)")
+    p.add_argument("--capacity-gb", type=float, help="기록 가능 용량(GB, 십진)")
+    p.add_argument("--per-file", type=int, help="파일당 오버헤드(바이트)")
+    p.add_argument("--fixed-mb", type=float, help="디스크당 고정 오버헤드(MB, 십진)")
+    p.add_argument("--label"); p.add_argument("--reset", action="store_true", help="세 종류를 기본값으로 복원")
+    p = sub.add_parser("media", help="디스크별 미디어 종류 지정/조회")
+    p.add_argument("name"); p.add_argument("key", nargs="?", help="BD100 / BD50 / BD25")
+    p.add_argument("--disks", nargs="*", type=int, help="적용할 디스크 번호")
+    p.add_argument("--from", dest="from_no", type=int, help="이 번호부터 현재 마지막 디스크까지")
+    p.add_argument("--default", action="store_true", help="지정 없는 디스크의 기본 미디어로 설정")
+    p.add_argument("--clear", action="store_true", help="지정 해제(--disks 생략 시 전체)")
     p = sub.add_parser("allocate", help="스캔 없이 현재 용량 설정으로 다시 배정")
     p.add_argument("name")
     p = sub.add_parser("export", help="하드링크 스테이징 + INDEX + CSV")
@@ -761,7 +895,42 @@ def main(argv=None):
         create_plan(conn, a.name, a.root, int(a.capacity_gb * unit), a.overhead)
         print("계획 생성 완료")
         return
+    if a.cmd == "mediatypes":
+        if a.reset:
+            reset_media_types(conn)
+        if a.set:
+            set_media_type(conn, a.set,
+                           None if a.capacity_gb is None else int(a.capacity_gb * GB), a.per_file,
+                           None if a.fixed_mb is None else int(a.fixed_mb * 1000 ** 2), a.label)
+        for k, t in media_types(conn).items():
+            print(f"{k:6} {t['label']:16} 용량 {t['capacity']:>15,} B ({t['capacity'] / GB:.3f} GB)  "
+                  f"파일당 {t['per_file']:,} B  고정 {t['fixed'] / 1000 ** 2:.1f} MB")
+        return
     plan = get_plan(conn, a.name)
+    if a.cmd == "media":
+        types = media_types(conn)
+        if a.key and a.key not in types:
+            raise SystemExit(f"알 수 없는 미디어 종류: {a.key} (사용 가능: {', '.join(types)})")
+        all_disks = [r[0] for r in conn.execute("SELECT disk_no FROM disk WHERE plan_id=? ORDER BY disk_no",
+                                                (plan["plan_id"],))]
+        if a.default:
+            set_default_media(conn, plan, None if a.clear else a.key)
+        elif a.clear:
+            assign_media(conn, plan, a.disks or list(get_disk_media(conn, plan)), None)
+        elif a.key:
+            nos = a.disks or ([n for n in all_disks if n >= a.from_no] if a.from_no else [])
+            if not nos:
+                raise SystemExit("적용할 디스크를 --disks 또는 --from 으로 지정하세요.")
+            assign_media(conn, plan, nos, a.key)
+        sp = Specs(conn, plan)
+        dm = sp.default_media
+        print(f"기본 미디어: {types[dm]['label'] if dm else '없음(계획의 용량·오버헤드 숫자 사용)'}")
+        for n in all_disks:
+            print(f"  disk{n:02d}: {sp.media_label(n) or '-':16} 사용 가능 {fmt(sp.cap(n))}, 파일당 {sp.ovh(n):,} B"
+                  + ("  (용량 직접 지정)" if n in sp.custom else ""))
+        if a.key or a.clear or a.default:
+            print("※ 적용하려면 allocate(재배정) 또는 scan 을 실행하세요.")
+        return
     if a.cmd == "subfolders":
         for f in list_subfolders(plan["root"]):
             print(f)
