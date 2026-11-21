@@ -7,6 +7,7 @@
 """
 import argparse
 import csv
+import json
 import os
 import re
 import sqlite3
@@ -249,6 +250,130 @@ class Specs:
     def max_file_size(self):
         """어느 디스크에든 들어갈 수 있는 가장 큰 파일 크기."""
         return max(self.cap(k) - self.ovh(k) for k in self.explicit + [self.far])
+
+
+# ---------------------------------------------------------------- settings save / load
+SETTINGS_VERSION = 1
+
+
+def export_settings(conn, plan, folders=None, extra=None):
+    """①~⑤ 설정을 dict 로: 원본·이름·용량·오버헤드, 기본 미디어, 폴더 선택/순서, 디스크별 미디어, 미디어 종류 값.
+    folders 를 주면 그 목록(화면의 체크·순서)을, 없으면 DB 의 선택 목록을 쓴다. extra 는 그대로 합쳐 저장(화면 전용 값 등)."""
+    pid = plan["plan_id"]
+    if folders is None:
+        folders = [r[0] for r in conn.execute("SELECT folder_path FROM selected_folder WHERE plan_id=? ORDER BY seq",
+                                              (pid,))]
+    d = {
+        "app": "bd_planner", "version": SETTINGS_VERSION, "saved_at": now(),
+        "plan": {"name": plan["name"], "root": plan["root"], "capacity_bytes": plan["capacity"],
+                 "overhead_per_file": plan["overhead"]},
+        "folders": list(folders),
+        "default_media": get_setting(conn, plan, "default_media"),
+        "disk_media": {str(n): k for n, k in sorted(get_disk_media(conn, plan).items())},
+        "media_types": {k: {"label": t["label"], "capacity_bytes": t["capacity"],
+                            "per_file_overhead": t["per_file"], "fixed_overhead": t["fixed"]}
+                        for k, t in media_types(conn).items()},
+    }
+    if extra:
+        d.update(extra)
+    return d
+
+
+def write_settings(path, data):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+
+
+def read_settings(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"설정 파일을 읽을 수 없습니다: {e}")
+    if not isinstance(d, dict) or d.get("app") != "bd_planner" or "plan" not in d:
+        raise SystemExit("BD-Planner 설정 파일이 아닙니다.")
+    if d.get("version", 0) > SETTINGS_VERSION:
+        raise SystemExit("더 새로운 버전에서 저장한 설정 파일입니다. 프로그램을 업데이트하세요.")
+    return d
+
+
+def media_types_differ(conn, data):
+    """저장된 미디어 종류 값이 지금 값과 다른 키 목록."""
+    cur = media_types(conn)
+    out = []
+    for k, t in (data.get("media_types") or {}).items():
+        c = cur.get(k)
+        if c and (c["capacity"], c["per_file"], c["fixed"]) != (
+                t.get("capacity_bytes"), t.get("per_file_overhead"), t.get("fixed_overhead")):
+            out.append(k)
+    return out
+
+
+def apply_settings(conn, data, name=None, root=None, apply_media_types=False, force=False):
+    """설정을 DB 에 반영한다. (plan, notes) 반환.
+    계획이 없으면 만들고, 있으면 용량·오버헤드를 갱신. 스캔 결과가 있으면 폴더 선택은 건드리지 않고(다음 스캔 때 적용),
+    원본 폴더가 달라지면 force 없이는 거부한다. 배정은 바꾸지 않는다(재배정은 사용자가 실행)."""
+    p = data["plan"]
+    name, root = name or p["name"], root or p["root"]
+    notes = []
+    row = conn.execute("SELECT plan_id, root_path FROM plan WHERE name=?", (name,)).fetchone()
+    scanned = bool(row and conn.execute("SELECT 1 FROM file_info WHERE plan_id=? LIMIT 1", (row[0],)).fetchone())
+    if row is None:
+        create_plan(conn, name, root, p.get("capacity_bytes", DEFAULT_CAPACITY), p.get("overhead_per_file", 0))
+    else:
+        if os.path.normcase(row[1]) != os.path.normcase(root):
+            if scanned and not force:
+                raise SystemExit(f"계획 '{name}' 은(는) 다른 원본 폴더({row[1]})로 스캔되어 있습니다. "
+                                 "바꾸면 스캔·배정이 초기화됩니다(--force).")
+            if not os.path.isdir(root):
+                raise SystemExit(f"원본 폴더에 접근할 수 없습니다: {root}")
+            if scanned:
+                for t in ("selected_folder", "file_info", "assignment", "disk", "warning"):
+                    conn.execute(f"DELETE FROM {t} WHERE plan_id=?", (row[0],))
+                scanned = False
+                notes.append("원본 폴더가 바뀌어 기존 스캔·배정을 초기화했습니다.")
+        conn.execute("UPDATE plan SET root_path=?, disk_capacity_bytes=?, overhead_per_file=? WHERE plan_id=?",
+                     (root, p.get("capacity_bytes", DEFAULT_CAPACITY), p.get("overhead_per_file", 0), row[0]))
+        conn.commit()
+    plan = get_plan(conn, name)
+
+    # 미디어 종류 값(전 계획 공통)
+    diff = media_types_differ(conn, data)
+    if apply_media_types:
+        for k, t in (data.get("media_types") or {}).items():
+            if k in media_types(conn):
+                set_media_type(conn, k, t.get("capacity_bytes"), t.get("per_file_overhead"),
+                               t.get("fixed_overhead"), t.get("label"))
+        if diff:
+            notes.append("미디어 종류 값을 저장된 값으로 바꿨습니다: " + ", ".join(diff))
+    elif diff:
+        notes.append("저장된 미디어 종류 값이 현재와 다릅니다(" + ", ".join(diff) + ") — 적용하지 않았습니다.")
+
+    # 폴더 선택·순서
+    want = data.get("folders") or []
+    if scanned:
+        notes.append("스캔 결과가 있어 폴더 선택은 DB 에 반영하지 않았습니다(다음 스캔 때 화면의 선택이 적용됩니다).")
+    else:
+        ok = [f for f in want if os.path.isdir(os.path.join(plan["root"], f))]
+        if len(ok) != len(want):
+            notes.append("원본에 없는 폴더는 건너뜀: " + ", ".join(f for f in want if f not in ok))
+        set_folders(conn, plan, ok)
+
+    # 기본 미디어·디스크별 미디어
+    types = media_types(conn)
+    dm = data.get("default_media")
+    set_default_media(conn, plan, dm if dm in types else None)
+    if dm and dm not in types:
+        notes.append(f"알 수 없는 기본 미디어 종류: {dm}")
+    conn.execute("DELETE FROM disk_media WHERE plan_id=?", (plan["plan_id"],))
+    for n, k in (data.get("disk_media") or {}).items():
+        if k in types and str(n).isdigit():
+            conn.execute("INSERT OR REPLACE INTO disk_media VALUES(?,?,?)", (plan["plan_id"], int(n), k))
+        else:
+            notes.append(f"무시한 디스크 미디어 지정: disk{n}={k}")
+    conn.commit()
+    log_event(conn, plan, 0, "설정 불러옴", f"저장 시각 {data.get('saved_at', '?')}")
+    return plan, notes
 
 
 def create_plan(conn, name, root, capacity=DEFAULT_CAPACITY, overhead=0):
@@ -864,6 +989,13 @@ def main(argv=None):
     p.add_argument("--from", dest="from_no", type=int, help="이 번호부터 현재 마지막 디스크까지")
     p.add_argument("--default", action="store_true", help="지정 없는 디스크의 기본 미디어로 설정")
     p.add_argument("--clear", action="store_true", help="지정 해제(--disks 생략 시 전체)")
+    p = sub.add_parser("save-settings", help="①~⑤ 설정(원본·용량·오버헤드·폴더 선택/순서·미디어 지정·스테이징)을 JSON 으로 저장")
+    p.add_argument("name"); p.add_argument("file"); p.add_argument("--stage", help="스테이징 위치도 함께 저장")
+    p = sub.add_parser("load-settings", help="저장한 설정을 불러와 계획에 반영(재배정은 따로 allocate/scan)")
+    p.add_argument("file"); p.add_argument("--name", help="계획 이름을 바꿔서 불러오기")
+    p.add_argument("--root", help="원본 폴더를 다른 경로로(다른 PC 에서 불러올 때)")
+    p.add_argument("--apply-media-types", action="store_true", help="저장된 100G/50G/25G 용량·오버헤드도 적용")
+    p.add_argument("--force", action="store_true", help="원본 폴더가 달라도 기존 스캔·배정을 초기화하고 적용")
     p = sub.add_parser("allocate", help="스캔 없이 현재 용량 설정으로 다시 배정")
     p.add_argument("name")
     p = sub.add_parser("export", help="하드링크 스테이징 + INDEX + CSV")
@@ -906,7 +1038,19 @@ def main(argv=None):
             print(f"{k:6} {t['label']:16} 용량 {t['capacity']:>15,} B ({t['capacity'] / GB:.3f} GB)  "
                   f"파일당 {t['per_file']:,} B  고정 {t['fixed'] / 1000 ** 2:.1f} MB")
         return
+    if a.cmd == "load-settings":
+        plan, notes = apply_settings(conn, read_settings(a.file), a.name, a.root, a.apply_media_types, a.force)
+        print(f"계획 '{plan['name']}' 에 설정을 반영했습니다. (원본 {plan['root']})")
+        for n in notes:
+            print("※", n)
+        print("※ 배정에 반영하려면 allocate(재배정) 또는 scan 을 실행하세요.")
+        return
     plan = get_plan(conn, a.name)
+    if a.cmd == "save-settings":
+        extra = {"ui": {"stage": a.stage}} if a.stage else None
+        write_settings(a.file, export_settings(conn, plan, extra=extra))
+        print(f"저장됨: {a.file}")
+        return
     if a.cmd == "media":
         types = media_types(conn)
         if a.key and a.key not in types:

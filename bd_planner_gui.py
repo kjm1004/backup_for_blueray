@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """BD-Planner GUI (tkinter). bd_planner.py 와 같은 폴더에 두고 실행한다."""
+import json
 import os
 import queue
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bd_planner as core  # noqa: E402
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bd_planner.db")
+STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bd_planner_gui_state.json")
 CHECK, UNCHECK = "☑", "☐"
 NO_MEDIA = "(없음: 위 숫자 사용)"
 
@@ -27,6 +29,8 @@ class App(tk.Tk):
         self.busy = False
         self.plan = None
         self._build()
+        self.restore_state()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._poll)
 
     # ------------------------------------------------------------ UI
@@ -53,6 +57,11 @@ class App(tk.Tk):
         ttk.Label(top, text="※ 파일 1개마다 용량에 더해 계산(UDF 메타데이터·섹터 올림 보정). 0이면 사용 안 함.",
                   foreground="#555").grid(row=1, column=0, columnspan=5, sticky="w", **pad)
         ttk.Button(top, text="폴더 목록 읽기", command=self.load_folders).grid(row=0, column=8, **pad)
+        ttk.Button(top, text="설정 저장…", command=self.save_settings).grid(row=2, column=0, **pad)
+        ttk.Button(top, text="설정 불러오기…", command=self.load_settings).grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(top, text="※ ①~⑤ 설정(원본·이름·용량·오버헤드·기본 미디어·폴더 선택/순서·디스크별 미디어·스테이징 위치)을 파일로 저장/복원합니다. "
+                            "스캔·배정·이력은 저장하지 않습니다.",
+                  foreground="#555").grid(row=2, column=3, columnspan=6, sticky="w", **pad)
         ttk.Label(top, text="기본 미디어").grid(row=3, column=0, **pad)
         self.defmedia_var = tk.StringVar(value=NO_MEDIA)
         self.defmedia_cb = ttk.Combobox(top, textvariable=self.defmedia_var, width=30, state="readonly")
@@ -452,6 +461,138 @@ class App(tk.Tk):
             sp = core.Specs(self.conn, self.plan)
             self.media_var.set(sp.media_label(sel[0]))
             self.media_info.set(f"사용 가능 {core.fmt(sp.cap(sel[0]))} · 파일당 오버헤드 {sp.ovh(sel[0]):,}B")
+
+    # ------------------------------------------------------------ settings save / load
+    def ui_values(self):
+        return {"unit": self.unit_var.get(), "capacity_text": self.cap_var.get(), "stage": self.stage_var.get()}
+
+    def set_ui_values(self, ui):
+        if ui.get("unit") in ("GB(십진)", "GiB(이진)"):
+            self.unit_var.set(ui["unit"])
+        if ui.get("capacity_text"):
+            self.cap_var.set(ui["capacity_text"])
+        if ui.get("stage") is not None:
+            self.stage_var.set(ui["stage"])
+
+    def save_settings(self):
+        try:
+            plan = self.ensure_plan()
+            self.save_default_media()
+        except ValueError as e:
+            if str(e) != "취소됨":
+                messagebox.showerror("오류", str(e))
+            return
+        path = filedialog.asksaveasfilename(
+            title="설정 저장", defaultextension=".json", initialfile=f"{plan['name']}_설정.json",
+            filetypes=[("BD-Planner 설정", "*.json"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        try:
+            core.write_settings(path, core.export_settings(self.conn, plan, self.checked(),
+                                                           {"ui": self.ui_values()}))
+        except OSError as e:
+            messagebox.showerror("오류", f"저장할 수 없습니다:\n{e}")
+            return
+        self.say(f"설정 저장: {path}  (폴더 {len(self.checked())}개 선택, 디스크별 미디어 "
+                 f"{len(core.get_disk_media(self.conn, plan))}개)")
+
+    def load_settings(self):
+        path = filedialog.askopenfilename(title="설정 불러오기",
+                                          filetypes=[("BD-Planner 설정", "*.json"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        try:
+            data = core.read_settings(path)
+        except SystemExit as e:
+            messagebox.showerror("오류", str(e))
+            return
+        p = data["plan"]
+        root = p.get("root", "")
+        if not os.path.isdir(root):
+            messagebox.showwarning("원본 폴더 없음", f"저장된 원본 폴더를 이 PC에서 찾을 수 없습니다:\n{root}\n"
+                                   "현재 PC의 원본 폴더를 선택해 주세요.")
+            root = filedialog.askdirectory(title="원본 폴더 선택")
+            if not root:
+                return
+            root = os.path.normpath(root)
+        # ① 화면 값
+        self.root_var.set(root)
+        self.name_var.set(p.get("name", ""))
+        ui = data.get("ui") or {}
+        unit_gib = ui.get("unit", "GB(십진)").startswith("GiB")
+        self.unit_var.set("GiB(이진)" if unit_gib else "GB(십진)")
+        cap = p.get("capacity_bytes")
+        self.cap_var.set(ui.get("capacity_text") or (f"{cap / (core.GIB if unit_gib else core.GB):.6g}" if cap else "90"))
+        self.ovh_var.set(str(p.get("overhead_per_file", 4096)))
+        self.set_ui_values({"stage": ui.get("stage")})
+        # 계획 생성/갱신(원본이 달라지면 확인)
+        try:
+            self.ensure_plan()
+        except ValueError as e:
+            if str(e) != "취소됨":
+                messagebox.showerror("오류", str(e))
+            return
+        apply_types = False
+        diff = core.media_types_differ(self.conn, data)
+        if diff:
+            apply_types = messagebox.askyesno(
+                "미디어 종류 값 다름",
+                "저장된 미디어 종류 값이 현재와 다릅니다: " + ", ".join(diff) +
+                "\n(모든 계획에 공통으로 적용되는 값입니다.)\n\n저장된 값으로 바꿀까요?")
+        try:
+            plan, notes = core.apply_settings(self.conn, data, self.name_var.get().strip(), root, apply_types)
+        except SystemExit as e:
+            messagebox.showerror("오류", str(e))
+            return
+        self.refresh_media_widgets()
+        self.load_folders()                       # DB 선택(스캔 전이면 방금 반영됨)을 목록에 표시
+        self.apply_folder_selection(data.get("folders") or [])   # 스캔 결과가 있어도 화면 선택·순서는 복원
+        self.say(f"설정 불러옴: {path}")
+        for n in notes:
+            self.say(f"  ※ {n}")
+        if core.get_disk_media(self.conn, plan) or core.get_setting(self.conn, plan, "default_media"):
+            self.say("  ※ 미디어 지정을 배정에 반영하려면 [재배정]을 누르세요.")
+
+    def apply_folder_selection(self, names):
+        """목록에서 names 를 ☑ 하고 그 순서대로 맨 위에 올린다. 나머지는 ☐ 로 아래에."""
+        rows = {self.ftree.item(i, "values")[2]: list(self.ftree.item(i, "values")) for i in self.ftree.get_children()}
+        chosen = [n for n in names if n in rows]
+        missing = [n for n in names if n not in rows]
+        order = chosen + [n for n in rows if n not in chosen]
+        self.ftree.delete(*self.ftree.get_children())
+        for n in order:
+            v = rows[n]
+            v[0] = CHECK if n in chosen else UNCHECK
+            self.ftree.insert("", "end", values=v)
+        self.scan_sum = None
+        self.renumber()
+        if missing:
+            self.say("  ※ 원본에 없는 폴더는 건너뜀: " + ", ".join(missing))
+
+    def restore_state(self):
+        """마지막으로 쓴 ① 화면 값을 복원하고, 원본이 있으면 폴더 목록을 자동으로 읽는다."""
+        try:
+            with open(STATE_PATH, encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            return
+        for key, var in (("root", self.root_var), ("name", self.name_var), ("overhead", self.ovh_var)):
+            if st.get(key):
+                var.set(st[key])
+        if st.get("capacity_text"):
+            self.cap_var.set(st["capacity_text"])
+        self.set_ui_values({"unit": st.get("unit"), "stage": st.get("stage")})
+        if st.get("root") and st.get("name") and os.path.isdir(st["root"]):
+            self.after(300, self.load_folders)
+
+    def on_close(self):
+        try:
+            with open(STATE_PATH, "w", encoding="utf-8") as fh:
+                json.dump({"root": self.root_var.get(), "name": self.name_var.get(),
+                           "overhead": self.ovh_var.get(), **self.ui_values()}, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        self.destroy()
 
     # ------------------------------------------------------------ media types
     def media_pairs(self):
