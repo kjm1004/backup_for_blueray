@@ -60,11 +60,6 @@ class App(tk.Tk):
         ttk.Button(top, text="미디어 종류 설정…", command=self.edit_media_types).grid(row=3, column=5, columnspan=2, **pad)
         ttk.Label(top, text="※ 지정 없는 디스크는 이 미디어(100G/50G/25G)의 용량·오버헤드를 씁니다. '(없음)'이면 위 숫자(디스크 용량·오버헤드)를 사용.",
                   foreground="#555").grid(row=4, column=0, columnspan=9, sticky="w", **pad)
-        ttk.Label(top, text="디스크별 용량").grid(row=2, column=0, **pad)
-        self.caps_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.caps_var, width=34).grid(row=2, column=1, columnspan=4, sticky="we", **pad)
-        ttk.Label(top, text="※ disk01부터 쉼표로 구분(위 단위). 예: 95, 23.3, , 45  → 비운 칸·나머지는 기본 용량",
-                  foreground="#555").grid(row=2, column=5, columnspan=4, sticky="w", **pad)
 
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -117,16 +112,6 @@ class App(tk.Tk):
         ttk.Button(act, text="변경", command=self.change_status).pack(side="left")
         ttk.Button(act, text="경로·크기 검증(DB)…", command=self.run_verify).pack(side="left", padx=12)
 
-        cap = ttk.Frame(right)
-        cap.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Label(cap, text="선택 디스크 용량:").pack(side="left")
-        self.cap_one_var = tk.StringVar()
-        ttk.Entry(cap, textvariable=self.cap_one_var, width=8).pack(side="left", padx=4)
-        ttk.Label(cap, text="(위 단위)").pack(side="left")
-        ttk.Button(cap, text="적용 후 재배정", command=self.apply_disk_capacity).pack(side="left", padx=6)
-        ttk.Button(cap, text="기본 용량으로", command=lambda: self.apply_disk_capacity(reset=True)).pack(side="left")
-        ttk.Button(cap, text="재배정", command=self.run_realloc).pack(side="left", padx=12)
-
         md = ttk.Frame(right)
         md.pack(fill="x", padx=4, pady=(4, 0))
         ttk.Label(md, text="선택 디스크 미디어:").pack(side="left")
@@ -136,6 +121,7 @@ class App(tk.Tk):
         ttk.Button(md, text="적용 후 재배정", command=self.apply_media).pack(side="left")
         ttk.Button(md, text="선택 번호~끝까지", command=lambda: self.apply_media(to_end=True)).pack(side="left", padx=4)
         ttk.Button(md, text="해제", command=lambda: self.apply_media(clear=True)).pack(side="left")
+        ttk.Button(md, text="재배정", command=self.run_realloc).pack(side="left", padx=8)
         self.media_info = tk.StringVar()
         ttk.Label(md, textvariable=self.media_info, foreground="#555").pack(side="left", padx=8)
 
@@ -186,42 +172,6 @@ class App(tk.Tk):
         except ValueError:
             raise ValueError("디스크 용량은 숫자여야 합니다.")
         return int(v * (core.GIB if self.unit_var.get().startswith("GiB") else core.GB))
-
-    def unit_bytes(self):
-        return core.GIB if self.unit_var.get().startswith("GiB") else core.GB
-
-    def parse_caps(self):
-        """'95, 23.3, , 45' → [bytes, bytes, None, bytes]"""
-        out = []
-        for tok in self.caps_var.get().replace("，", ",").split(","):
-            tok = tok.strip()
-            if not tok:
-                out.append(None)
-                continue
-            try:
-                v = float(tok)
-            except ValueError:
-                raise ValueError(f"디스크별 용량에 숫자가 아닌 값이 있습니다: '{tok}'")
-            if v <= 0:
-                raise ValueError("디스크별 용량은 0보다 커야 합니다.")
-            out.append(int(v * self.unit_bytes()))
-        while out and out[-1] is None:
-            out.pop()
-        return out
-
-    def sync_caps_entry(self):
-        """DB 의 디스크별 용량 지정을 입력칸에 반영."""
-        if not self.plan:
-            return
-        caps = core.get_capacities(self.conn, self.plan)
-        if not caps:
-            self.caps_var.set("")
-            return
-        u = self.unit_bytes()
-        vals = []
-        for n in range(1, max(caps) + 1):
-            vals.append(f"{caps[n] / u:.6g}" if n in caps else "")
-        self.caps_var.set(", ".join(vals))
 
     def overhead(self):
         try:
@@ -285,7 +235,6 @@ class App(tk.Tk):
                                                  f"{cnt:,}" if cnt else ("신규" if scanned and f not in saved else ""),
                                                  core.fmt(size) if size else ""))
         self.renumber()
-        self.sync_caps_entry()
         self.sync_default_media()
         self.refresh_disks()
         self.say(f"원본: {plan['root']}  (하부 폴더 {len(subs)}개)")
@@ -397,7 +346,6 @@ class App(tk.Tk):
             return
         core.set_folders(self.conn, plan, names)
         try:
-            core.set_capacities(self.conn, plan, self.parse_caps())   # 입력칸 = 디스크별 용량(스캔 시 저장)
             self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
@@ -413,7 +361,7 @@ class App(tk.Tk):
             n, b, nd = res
             dec, bi = core.estimate_disks(b, plan["capacity"])
             self.say(f"스캔 완료: 파일 {n:,}개, {core.fmt(b)}")
-            self.say(f"예상 디스크 수(기본 용량 기준): 십진 {dec}장 / 이진 {bi}장 → 디스크별 용량 반영 실제 배정 {nd}장")
+            self.say(f"예상 디스크 수(기본 용량 기준): 십진 {dec}장 / 이진 {bi}장 → 미디어 설정 반영 실제 배정 {nd}장")
             self.scan_sum = f"선택 {len(names)}개 · {n:,}개 파일 · {core.fmt(b)} · 배정 {nd}장"
             self.sum_var.set(self.scan_sum)
             self.load_folders()
@@ -445,7 +393,6 @@ class App(tk.Tk):
                                 "(먼저 [폴더 목록 읽기]로 원본의 새 폴더를 불러옵니다.)")
             return
         try:
-            core.set_capacities(self.conn, plan, self.parse_caps())
             self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
@@ -503,7 +450,6 @@ class App(tk.Tk):
         sel = self.selected_disks()
         if len(sel) == 1 and self.plan:
             sp = core.Specs(self.conn, self.plan)
-            self.cap_one_var.set(f"{sp.cap(sel[0]) / self.unit_bytes():.6g}")
             self.media_var.set(sp.media_label(sel[0]))
             self.media_info.set(f"사용 가능 {core.fmt(sp.cap(sel[0]))} · 파일당 오버헤드 {sp.ovh(sel[0]):,}B")
 
@@ -547,7 +493,9 @@ class App(tk.Tk):
         if to_end:
             nos = list(range(min(nos), max(int(i) for i in self.dtree.get_children()) + 1))
         core.assign_media(self.conn, self.plan, nos, key)
-        self.sync_caps_entry()
+        if clear:                       # 해제하면 예전에 CLI 로 지정한 직접 용량도 함께 지움
+            for n in nos:
+                core.set_capacity(self.conn, self.plan, n, None)
         self.say(("미디어 지정 해제: " if clear else f"미디어 {self.media_var.get()} 지정: ") +
                  ", ".join(f"disk{n:02d}" for n in nos))
         self.run_realloc(changed=min(nos))
@@ -612,26 +560,9 @@ class App(tk.Tk):
             "파일마다 더하는 값(파일당)과 디스크마다 빼 두는 값(고정)이 있습니다. 바꾼 값은 [재배정] 후 반영됩니다.")
         ).pack(padx=8, pady=(0, 8))
 
-    # ------------------------------------------------------------ per-disk capacity
-    def apply_disk_capacity(self, reset=False):
-        nos = self.selected_disks()
-        if not nos or not self.plan:
-            messagebox.showinfo("선택 없음", "용량을 바꿀 디스크를 선택하세요.")
-            return
-        try:
-            val = None if reset else float(self.cap_one_var.get())
-            if val is not None and val <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("오류", "용량은 0보다 큰 숫자여야 합니다.")
-            return
-        for n in nos:
-            core.set_capacity(self.conn, self.plan, n, None if val is None else int(val * self.unit_bytes()))
-        self.sync_caps_entry()
-        self.run_realloc(changed=min(nos))
-
+    # ------------------------------------------------------------ re-allocate
     def run_realloc(self, changed=None):
-        """스캔 없이 현재 용량 설정으로 다시 배정."""
+        """스캔 없이 현재 미디어 설정으로 다시 배정."""
         if not self.plan:
             messagebox.showinfo("확인", "먼저 스캔 + 배정 계산을 실행하세요.")
             return
@@ -640,7 +571,6 @@ class App(tk.Tk):
             messagebox.showinfo("확인", "스캔 결과가 없습니다. 먼저 스캔 + 배정 계산을 실행하세요.")
             return
         try:
-            core.set_capacities(self.conn, plan, self.parse_caps())
             self.save_default_media()
         except ValueError as e:
             messagebox.showerror("오류", str(e))
