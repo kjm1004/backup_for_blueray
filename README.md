@@ -11,7 +11,7 @@ python bd_planner.py capacity 사진2차 2=default               # 한 디스크
 python bd_planner.py allocate 사진2차                         # 재스캔 없이 현재 용량 설정으로 다시 배정
 python bd_planner.py export 사진2차 --stage "H:\_BD_STAGE" --disks 1   # 하드링크 스테이징 + INDEX.txt + CSV
 python bd_planner.py status 사진2차 1 완료                    # 계획됨/굽는 중/완료/검증됨
-python bd_planner.py verify 사진2차 1 "F:\"                   # 굽기 후 경로·크기 대조(해시 없음)
+python bd_planner.py verify 사진2차 1 "F:\"                   # 경로·크기를 DB 와 대조(내용 비교 아님, 상태는 안 바꿈)
 ```
 ImgBurn: Build 모드 → 소스에 `H:\_BD_STAGE\disk01` 폴더 추가(폴더 내용이 디스크 루트가 되도록
 "Add Folder"가 아닌 폴더 내용 추가 사용) → 파일시스템 UDF → 볼륨 라벨은 INDEX.txt 첫 줄 참고 → 굽기.
@@ -46,3 +46,27 @@ python bd_planner.py export 사진2차 --stage "H:\_BD_STAGE" --disks 7 8   # �
 - '계획됨' 디스크의 남는 공간을 번호순으로 먼저 채우고, 넘치면 새 디스크(마지막 번호+1…)를 만듭니다(디스크별 용량 반영).
 - GUI: [폴더 목록 읽기] → 새 폴더에 '신규' 표시 → ☑ 체크 → **③' 새 폴더만 추가 배정**.
 - 기존 폴더 '안'에 파일이 추가·삭제·변경된 경우는 감지하지 않습니다(새 하위 폴더 추가만 지원).
+
+## 백업 이력 관리
+디스크마다 '언제 무엇을 했는지'가 DB 에 쌓입니다(전체 재스캔을 해도 이력은 유지).
+```
+python bd_planner.py record 사진2차 1 --media "VERBAT-IMk-000 #1" --location "책장 A"   # 백업 완료 기록(사본 #1)
+python bd_planner.py record 사진2차 1 --media "VERBAT-IMk-000 #2" --location "은행 금고"  # 같은 디스크의 사본 #2
+python bd_planner.py history 사진2차 [--disk 1]                                          # 사본 기록 + 이력
+```
+- 자동 기록되는 이벤트: 스테이징 내보냄, 상태 변경, 추가 배정, 구성 변경으로 상태 초기화, 전체 재스캔, 미디어 비교 결과.
+- 사본(복사본)별로 미디어 ID·보관 위치·구운 시각·마지막 검증 결과를 관리합니다.
+- GUI: 디스크를 선택하고 **백업 완료 기록…** / **이력 보기…**. 디스크 표에 `사본` 수와 `최근 검증`이 표시됩니다.
+
+## 스테이징(원본) ↔ 미디어 일치 검사
+```
+python bd_planner.py compare 사진2차 1 --stage "H:\_BD_STAGE" --media "I:\"          # 전체(바이트) 비교
+python bd_planner.py compare 사진2차 1 --stage "H:\_BD_STAGE" --media "I:\" --quick  # 존재·크기만
+```
+- 스테이징 `diskNN` 폴더와 미디어를 파일별로 대조합니다. **전체 비교**는 모든 파일을 바이트 단위로 읽어 비교하므로
+  95GB 디스크는 오래 걸리지만, 내용 변조·읽기 불량까지 잡습니다. **빠른 검사**는 없는 파일·추가 파일·크기 차이만 봅니다.
+- **전체 비교가 모두 일치해야 상태가 '검증됨'**이 됩니다. 불일치가 나오고 일치한 다른 사본이 없으면 '검증됨'→'완료'로 되돌립니다.
+- 숨김/시스템 속성 파일(Picasa.ini, Thumbs.db 등)은 ImgBurn 이 기본으로 굽지 않으므로 미디어에 없어도 실패로 치지 않고
+  "숨김/시스템 파일 미포함"으로 따로 보고합니다.
+- 종료 코드: 일치 0, 불일치 1 (스크립트 연동용). GUI: **스테이징↔미디어 비교…**(스테이징 위치는 ⑤에서 지정).
+- 스테이징이 사라졌다면(굽고 지움) 비교할 수 없습니다. 검증이 끝날 때까지 스테이징 폴더를 지우지 마세요.

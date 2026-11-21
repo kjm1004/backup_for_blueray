@@ -4,6 +4,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -84,11 +85,12 @@ class App(tk.Tk):
 
         right = ttk.LabelFrame(body, text="④ 디스크 배정 결과")
         body.add(right, weight=2)
-        self.dtree = ttk.Treeview(right, columns=("disk", "st", "cap", "used", "pct", "cnt", "folders"),
+        self.dtree = ttk.Treeview(right, columns=("disk", "st", "cap", "used", "pct", "cnt", "copy", "ver", "folders"),
                                   show="headings", selectmode="extended", height=12)
         for c, t, w, a in (("disk", "디스크", 70, "w"), ("st", "상태", 70, "w"), ("cap", "용량(GB)", 80, "e"),
                            ("used", "사용(GB)", 80, "e"),
-                           ("pct", "채움", 55, "e"), ("cnt", "파일수", 70, "e"), ("folders", "포함 폴더", 360, "w")):
+                           ("pct", "채움", 55, "e"), ("cnt", "파일수", 70, "e"), ("copy", "사본", 45, "e"),
+                           ("ver", "최근 검증", 120, "w"), ("folders", "포함 폴더", 300, "w")):
             self.dtree.heading(c, text=t)
             self.dtree.column(c, width=w, anchor=a, stretch=(c == "folders"))
         self.dtree.tag_configure("검증됨", foreground="#2e9d68")
@@ -104,7 +106,7 @@ class App(tk.Tk):
         ttk.Combobox(act, textvariable=self.st_var, values=core.STATUSES, width=8,
                      state="readonly").pack(side="left", padx=4)
         ttk.Button(act, text="변경", command=self.change_status).pack(side="left")
-        ttk.Button(act, text="굽기 후 검증…", command=self.run_verify).pack(side="left", padx=12)
+        ttk.Button(act, text="경로·크기 검증(DB)…", command=self.run_verify).pack(side="left", padx=12)
 
         cap = ttk.Frame(right)
         cap.pack(fill="x", padx=4, pady=(4, 0))
@@ -115,6 +117,13 @@ class App(tk.Tk):
         ttk.Button(cap, text="적용 후 재배정", command=self.apply_disk_capacity).pack(side="left", padx=6)
         ttk.Button(cap, text="기본 용량으로", command=lambda: self.apply_disk_capacity(reset=True)).pack(side="left")
         ttk.Button(cap, text="재배정", command=self.run_realloc).pack(side="left", padx=12)
+
+        hv = ttk.Frame(right)
+        hv.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(hv, text="이력·검증:").pack(side="left")
+        ttk.Button(hv, text="백업 완료 기록…", command=self.record_burn).pack(side="left", padx=6)
+        ttk.Button(hv, text="스테이징↔미디어 비교…", command=self.run_media_compare).pack(side="left")
+        ttk.Button(hv, text="이력 보기…", command=self.show_history).pack(side="left", padx=6)
 
         out = ttk.LabelFrame(right, text="⑤ 출력 (하드링크 스테이징 + INDEX.txt + 목록 CSV)")
         out.pack(fill="x", padx=4, pady=4)
@@ -446,6 +455,9 @@ class App(tk.Tk):
         plan = self.plan
         split = dict(core.split_folders(self.conn, plan))
         caps = core.get_capacities(self.conn, plan)
+        recs = {}
+        for r in core.burn_records(self.conn, plan):
+            recs.setdefault(r[1], []).append(r)
         for no, name, used, cnt, st in self.conn.execute(
                 "SELECT disk_no, disk_name, used_bytes, file_count, status FROM disk "
                 "WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],)).fetchall():
@@ -456,6 +468,7 @@ class App(tk.Tk):
             self.dtree.insert("", "end", iid=str(no), tags=(st,), values=(
                 name, st, f"{cap / core.GB:.2f}" + ("*" if no in caps else ""),
                 f"{used / core.GB:.2f}", f"{used * 100 / cap:.0f}%", f"{cnt:,}",
+                len(recs.get(no, [])) or "", self.last_verify(recs.get(no, [])),
                 " · ".join(parts)))
         again = [i for i in self._restore_sel if self.dtree.exists(i)]
         if again:
@@ -532,6 +545,150 @@ class App(tk.Tk):
             core.set_status(self.conn, self.plan, n, self.st_var.get())
         self.refresh_disks()
 
+    # ------------------------------------------------------------ history / media compare
+    @staticmethod
+    def last_verify(rows):
+        """사본 기록 중 가장 최근 검증 결과를 짧게 표시."""
+        done = [r for r in rows if r[6]]
+        if not done:
+            return ""
+        r = max(done, key=lambda x: x[6])
+        return ("✔ " if r[7] in ("전체일치", "빠른일치") else "✖ ") + f"{r[7]} {r[6][5:10]}"
+
+    def form(self, title, fields, initial=None):
+        """fields: [(key, 라벨)] 입력창. 확인하면 dict, 취소하면 None."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.grab_set()
+        vs = {}
+        for i, (k, label) in enumerate(fields):
+            ttk.Label(win, text=label).grid(row=i, column=0, padx=8, pady=4, sticky="e")
+            vs[k] = tk.StringVar(value=(initial or {}).get(k, ""))
+            ttk.Entry(win, textvariable=vs[k], width=38).grid(row=i, column=1, padx=8, pady=4)
+        out = {}
+
+        def ok():
+            out.update({k: v.get().strip() for k, v in vs.items()})
+            out["_ok"] = True
+            win.destroy()
+        bf = ttk.Frame(win)
+        bf.grid(row=len(fields), column=0, columnspan=2, pady=8)
+        ttk.Button(bf, text="확인", command=ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="취소", command=win.destroy).pack(side="left")
+        self.wait_window(win)
+        return out if out.get("_ok") else None
+
+    def one_disk(self):
+        nos = self.selected_disks()
+        if len(nos) != 1 or not self.plan:
+            messagebox.showinfo("확인", "디스크를 하나만 선택하세요.")
+            return None
+        return nos[0]
+
+    def record_burn(self):
+        n = self.one_disk()
+        if n is None:
+            return
+        f = self.form(f"disk{n:02d} 백업 완료 기록", [
+            ("copy", "사본 번호(비우면 자동)"), ("media", "미디어 ID/시리얼"),
+            ("loc", "보관 위치"), ("note", "메모")])
+        if not f:
+            return
+        try:
+            copy = int(f["copy"]) if f["copy"] else None
+            c = core.record_burn(self.conn, self.plan, n, copy, f["media"], f["loc"], f["note"])
+        except (ValueError, SystemExit) as e:
+            messagebox.showerror("오류", str(e) or "사본 번호는 숫자여야 합니다.")
+            return
+        self.say(f"disk{n:02d} 사본 {c} 백업 완료 기록됨 → 이제 '스테이징↔미디어 비교'로 검증하세요.")
+        self.refresh_disks()
+
+    def run_media_compare(self):
+        n = self.one_disk()
+        if n is None:
+            return
+        stage = self.stage_var.get().strip()
+        if not stage:
+            messagebox.showinfo("확인", "스테이징 위치를 먼저 지정하세요(⑤ 출력).")
+            return
+        stage_dir = os.path.join(stage, f"disk{n:02d}")
+        if not os.path.isdir(stage_dir):
+            messagebox.showerror("오류", f"스테이징 폴더가 없습니다:\n{stage_dir}\n먼저 내보내기를 하세요.")
+            return
+        media = filedialog.askdirectory(title=f"disk{n:02d} 를 구운 미디어(드라이브) 선택")
+        if not media:
+            return
+        ans = messagebox.askyesnocancel(
+            "비교 방식", "예: 전체(바이트) 비교 — 권장. 수 GB~수십 GB를 읽으므로 오래 걸립니다.\n"
+                        "아니요: 빠른 검사 — 존재·크기만 확인(내용 변조·읽기 불량은 못 잡음).")
+        if ans is None:
+            return
+        full, plan = bool(ans), self.plan
+        last = [0.0]
+
+        def fn(conn):
+            def prog(f, t, b):
+                if time.time() - last[0] > 0.3:
+                    last[0] = time.time()
+                    self.q.put(("prog", None, f"비교 중… {f:,}/{t:,}개 · {core.fmt(b)}"))
+            return core.verify_media(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, full, None, prog)
+
+        def done(res):
+            self.say(f"disk{n:02d} 미디어 비교 {'전체' if full else '빠른'}: {res['verdict']} — "
+                     f"{core.summarize_compare(res)}")
+            for key, label in (("missing", "미디어에 없음"), ("extra", "미디어에만 있음"),
+                               ("content_diff", "내용 다름"), ("hidden_missing", "숨김/시스템(미포함)")):
+                for r in res[key][:30]:
+                    self.say(f"  {label}: {r}")
+            for r, ss, ds in res["size_diff"][:30]:
+                self.say(f"  크기 다름: {r} (스테이징 {ss:,} / 미디어 {ds:,})")
+            for r, e in res["read_errors"][:30]:
+                self.say(f"  읽기 오류: {r} ({e})")
+            self.refresh_disks()
+            if res["ok"] and full:
+                messagebox.showinfo("검증 완료", f"disk{n:02d}: 스테이징과 미디어가 모두 일치합니다. ('검증됨')")
+            elif res["ok"]:
+                messagebox.showinfo("빠른 검사 일치", "존재·크기는 일치합니다. 내용까지 확인하려면 전체 비교를 하세요.")
+            else:
+                messagebox.showwarning("불일치", f"disk{n:02d}: {core.summarize_compare(res)}\n자세한 목록은 로그를 보세요.")
+        self.run_bg(fn, done, "미디어 비교 중…")
+
+    def show_history(self):
+        if not self.plan:
+            messagebox.showinfo("확인", "계획이 없습니다.")
+            return
+        nos = self.selected_disks()
+        disk = nos[0] if len(nos) == 1 else None
+        win = tk.Toplevel(self)
+        win.title("이력 · " + (f"disk{disk:02d}" if disk else "전체"))
+        win.geometry("980x560")
+        ttk.Label(win, text="사본(굽기) 기록").pack(anchor="w", padx=8, pady=(8, 0))
+        rt = ttk.Treeview(win, show="headings", height=7,
+                          columns=("disk", "copy", "media", "loc", "burned", "ver", "res", "note"))
+        for c, t, w in (("disk", "디스크", 60), ("copy", "사본", 40), ("media", "미디어 ID", 150),
+                        ("loc", "보관 위치", 120), ("burned", "구운 시각", 130), ("ver", "검증 시각", 130),
+                        ("res", "결과", 80), ("note", "메모", 150)):
+            rt.heading(c, text=t)
+            rt.column(c, width=w, anchor="w")
+        rt.pack(fill="x", padx=8, pady=4)
+        for _id, dn, cp, mid, loc, bat, vat, vres, note in core.burn_records(self.conn, self.plan, disk):
+            rt.insert("", "end", values=(f"disk{dn:02d}", cp, mid or "", loc or "", bat or "", vat or "",
+                                         vres or "", note or ""))
+        ttk.Label(win, text="이력 (최근 순)").pack(anchor="w", padx=8)
+        fr = ttk.Frame(win)
+        fr.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        ht = ttk.Treeview(fr, show="headings", columns=("at", "disk", "event", "detail"))
+        for c, t, w in (("at", "시각", 130), ("disk", "대상", 60), ("event", "이벤트", 200), ("detail", "내용", 500)):
+            ht.heading(c, text=t)
+            ht.column(c, width=w, anchor="w", stretch=(c == "detail"))
+        sb = ttk.Scrollbar(fr, orient="vertical", command=ht.yview)
+        ht.configure(yscrollcommand=sb.set)
+        ht.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for at, dn, ev, detail in reversed(core.history(self.conn, self.plan, disk)):
+            ht.insert("", "end", values=(at, "계획" if dn == 0 else f"disk{dn:02d}", ev, detail or ""))
+
     # ------------------------------------------------------------ export / verify
     def run_export(self):
         nos = self.selected_disks()
@@ -571,7 +728,7 @@ class App(tk.Tk):
         def done(res):
             ok, miss, extra, diff = res
             if ok:
-                self.say(f"disk{n:02d} 검증 일치 → '검증됨'으로 기록")
+                self.say(f"disk{n:02d} 경로·크기 일치(DB 기준). 내용 검증은 '스테이징↔미디어 비교'(전체)를 사용하세요.")
             else:
                 self.say(f"disk{n:02d} 불일치: 누락 {len(miss)}, 추가 {len(extra)}, 크기다름 {len(diff)}")
                 for lbl, lst in (("누락", miss), ("추가", extra), ("크기다름", diff)):

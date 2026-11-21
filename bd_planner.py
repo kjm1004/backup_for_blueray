@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS assignment(
   PRIMARY KEY(plan_id, file_id));
 CREATE TABLE IF NOT EXISTS warning(
   plan_id INTEGER, file_id INTEGER, kind TEXT, message TEXT);
+CREATE TABLE IF NOT EXISTS disk_history(
+  hist_id INTEGER PRIMARY KEY, plan_id INTEGER, disk_no INTEGER, at TEXT, event TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS burn_record(
+  rec_id INTEGER PRIMARY KEY, plan_id INTEGER, disk_no INTEGER, copy_no INTEGER,
+  media_id TEXT, location TEXT, burned_at TEXT, verified_at TEXT, verify_result TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS disk_capacity(
   plan_id INTEGER, disk_no INTEGER, capacity_bytes INTEGER, PRIMARY KEY(plan_id, disk_no));
 """
@@ -150,6 +155,7 @@ def scan(conn, plan, progress=None):
                            (pid,)).fetchall()
     total = _scan_folders(conn, plan, folders, progress)
     _size_warnings(conn, plan)
+    log_event(conn, plan, 0, "전체 재스캔", f"파일 {total[0]:,}개 — 배정·디스크 상태 초기화")
     return total
 
 
@@ -292,6 +298,8 @@ def allocate_new(conn, plan):
             conn.execute("UPDATE disk SET used_bytes=?, file_count=? WHERE plan_id=? AND disk_no=?",
                          (used, cnt, pid, n))
     conn.commit()
+    for t in sorted(touched):
+        log_event(conn, plan, t, "추가 배정", f"새 폴더 파일 배정 → 현재 {state[t][1]:,}개")
     return placed, sorted(touched)
 
 
@@ -380,6 +388,7 @@ def allocate(conn, plan):
             else:
                 _warn(conn, pid, None, "changed",
                       f"disk{n:02d}: 이미 '{prev[0]}' 상태였으나 구성이 바뀌어 '계획됨'으로 초기화됨 — 다시 구워야 합니다.")
+                log_event(conn, plan, n, "구성 변경", f"'{prev[0]}' → '계획됨' 초기화(재배정)")
     conn.commit()
     return disks
 
@@ -419,7 +428,7 @@ def disk_files(conn, plan, disk_no):
         "WHERE a.plan_id=? AND a.disk_no=? ORDER BY a.order_in_disk", (plan["plan_id"], disk_no)).fetchall()
 
 
-def set_status(conn, plan, disk_no, status, note=None):
+def set_status(conn, plan, disk_no, status, note=None, log=True):
     if status not in STATUSES:
         raise SystemExit(f"상태는 {STATUSES} 중 하나여야 합니다.")
     col = {"완료": "burned_at", "검증됨": "verified_at"}.get(status)
@@ -428,7 +437,190 @@ def set_status(conn, plan, disk_no, status, note=None):
         conn.execute(f"UPDATE disk SET {col}=? WHERE plan_id=? AND disk_no=?", (now(), plan["plan_id"], disk_no))
     if note is not None:
         conn.execute("UPDATE disk SET note=? WHERE plan_id=? AND disk_no=?", (note, plan["plan_id"], disk_no))
+    if log:
+        log_event(conn, plan, disk_no, f"상태 → {status}", note or "")
     conn.commit()
+
+
+# ---------------------------------------------------------------- history / burn records
+def log_event(conn, plan, disk_no, event, detail=""):
+    """이력 한 줄 추가. disk_no=0 은 계획 전체에 관한 이벤트."""
+    conn.execute("INSERT INTO disk_history(plan_id, disk_no, at, event, detail) VALUES(?,?,?,?,?)",
+                 (plan["plan_id"], disk_no, now(), event, detail))
+    conn.commit()
+
+
+def history(conn, plan, disk_no=None):
+    """(시각, 디스크번호, 이벤트, 내용) 오래된 순."""
+    q = "SELECT at, disk_no, event, detail FROM disk_history WHERE plan_id=?"
+    args = [plan["plan_id"]]
+    if disk_no is not None:
+        q += " AND disk_no=?"
+        args.append(disk_no)
+    return conn.execute(q + " ORDER BY hist_id", args).fetchall()
+
+
+def burn_records(conn, plan, disk_no=None):
+    """(rec_id, disk_no, copy_no, media_id, location, burned_at, verified_at, verify_result, note)"""
+    q = ("SELECT rec_id, disk_no, copy_no, media_id, location, burned_at, verified_at, verify_result, note "
+         "FROM burn_record WHERE plan_id=?")
+    args = [plan["plan_id"]]
+    if disk_no is not None:
+        q += " AND disk_no=?"
+        args.append(disk_no)
+    return conn.execute(q + " ORDER BY disk_no, copy_no", args).fetchall()
+
+
+def record_burn(conn, plan, disk_no, copy_no=None, media_id="", location="", note=""):
+    """'이 디스크를 미디어에 구웠다' 기록(사본 번호별). 상태는 '완료'로(이미 '검증됨'이면 유지). 사본 번호를 돌려준다."""
+    pid = plan["plan_id"]
+    row = conn.execute("SELECT status FROM disk WHERE plan_id=? AND disk_no=?", (pid, disk_no)).fetchone()
+    if not row:
+        raise SystemExit(f"disk{disk_no:02d} 이(가) 없습니다.")
+    if copy_no is None:
+        copy_no = conn.execute("SELECT COALESCE(MAX(copy_no),0)+1 FROM burn_record WHERE plan_id=? AND disk_no=?",
+                               (pid, disk_no)).fetchone()[0]
+    if conn.execute("SELECT 1 FROM burn_record WHERE plan_id=? AND disk_no=? AND copy_no=?",
+                    (pid, disk_no, copy_no)).fetchone():
+        raise SystemExit(f"disk{disk_no:02d} 사본 {copy_no} 은(는) 이미 기록되어 있습니다.")
+    conn.execute("INSERT INTO burn_record(plan_id, disk_no, copy_no, media_id, location, burned_at, note) "
+                 "VALUES(?,?,?,?,?,?,?)", (pid, disk_no, copy_no, media_id, location, now(), note))
+    if row[0] in (STATUSES[0], STATUSES[1]):
+        set_status(conn, plan, disk_no, "완료", log=False)
+    detail = f"사본 {copy_no}" + (f", 미디어 {media_id}" if media_id else "") + \
+             (f", 보관 {location}" if location else "") + (f" — {note}" if note else "")
+    log_event(conn, plan, disk_no, "백업 완료 기록", detail)
+    conn.commit()
+    return copy_no
+
+
+# ---------------------------------------------------------------- staging <-> media compare
+_SKIP_NAMES = {"system volume information", "$recycle.bin"}
+CHUNK = 4 * 1024 * 1024
+
+
+def _walk_files(root):
+    """{정규화된 상대경로: (표시용 상대경로, 전체경로)}"""
+    base = long_path(root)
+    out = {}
+    for d, dirs, fs in os.walk(base):
+        dirs[:] = [x for x in dirs if x.lower() not in _SKIP_NAMES]
+        for f in fs:
+            full = os.path.join(d, f)
+            rel = os.path.relpath(full, base)
+            out[os.path.normcase(rel)] = (rel, full)
+    return out
+
+
+def _is_hidden_or_system(path):
+    """Windows 숨김/시스템 속성(ImgBurn 이 기본으로 빼는 파일). 다른 OS 는 항상 False."""
+    try:
+        return bool(getattr(os.stat(path), "st_file_attributes", 0) & 0x6)
+    except OSError:
+        return False
+
+
+def _same_content(a, b, on_bytes=None):
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(CHUNK), fb.read(CHUNK)
+            if on_bytes:
+                on_bytes(len(ca))
+            if ca != cb:
+                return False
+            if not ca:
+                return True
+
+
+def compare_dirs(src, dst, full=True, progress=None):
+    """스테이징 폴더(src)와 미디어(dst)를 대조한다.
+    full=True 면 모든 파일을 바이트 단위로 비교, False 면 존재·크기만(빠른 검사).
+    숨김/시스템 파일이 미디어에 없는 것은 실패로 치지 않고 따로 보고한다(ImgBurn 이 기본 제외).
+    progress(done_files, total_files, done_bytes) 를 주기적으로 호출."""
+    a, b = _walk_files(src), _walk_files(dst)
+    res = {"total": len(a), "matched": 0, "bytes": 0, "missing": [], "hidden_missing": [], "extra": [],
+           "size_diff": [], "content_diff": [], "read_errors": [], "full": full}
+    done_b = [0]
+    done_f = 0
+    for key in sorted(a, key=lambda k: natural_key(a[k][0])):
+        rel, sp = a[key]
+        done_f += 1
+        if progress:
+            progress(done_f, len(a), done_b[0])
+        if key not in b:
+            (res["hidden_missing"] if _is_hidden_or_system(sp) else res["missing"]).append(rel)
+            continue
+        dp = b[key][1]
+        try:
+            ss, ds = os.path.getsize(sp), os.path.getsize(dp)
+            if ss != ds:
+                res["size_diff"].append((rel, ss, ds))
+                continue
+            if full:
+                def tick(n):
+                    done_b[0] += n
+                    if progress:
+                        progress(done_f, len(a), done_b[0])
+                if not _same_content(sp, dp, tick):
+                    res["content_diff"].append(rel)
+                    continue
+        except OSError as e:
+            res["read_errors"].append((rel, str(e)))
+            continue
+        res["matched"] += 1
+        res["bytes"] += ss
+    res["extra"] = sorted(b[k][0] for k in set(b) - set(a))
+    res["ok"] = not (res["missing"] or res["extra"] or res["size_diff"] or res["content_diff"] or res["read_errors"])
+    return res
+
+
+def summarize_compare(res):
+    parts = [f"일치 {res['matched']:,}/{res['total']:,}개"]
+    for key, label in (("missing", "미디어에 없음"), ("extra", "미디어에만 있음"), ("size_diff", "크기 다름"),
+                       ("content_diff", "내용 다름"), ("read_errors", "읽기 오류")):
+        if res[key]:
+            parts.append(f"{label} {len(res[key])}")
+    if res["hidden_missing"]:
+        parts.append(f"숨김/시스템 파일 미포함 {len(res['hidden_missing'])}(정상 범위)")
+    return ", ".join(parts)
+
+
+def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=None, progress=None):
+    """스테이징(원본)↔미디어 비교 후 이력에 기록. 전체(바이트) 비교가 모두 일치하면 상태를 '검증됨'으로.
+    copy_no 가 없으면 가장 최근 사본 기록에 결과를 붙이고, 사본 기록이 없으면 새로 만든다."""
+    if not os.path.isdir(stage_dir):
+        raise SystemExit(f"스테이징 폴더가 없습니다: {stage_dir}")
+    if not os.path.isdir(media_dir):
+        raise SystemExit(f"미디어 경로에 접근할 수 없습니다: {media_dir}")
+    res = compare_dirs(stage_dir, media_dir, full, progress)
+    mode = "전체(바이트)" if full else "빠른(크기)"
+    verdict = ("전체일치" if full else "빠른일치") if res["ok"] else "불일치"
+    pid = plan["plan_id"]
+    rec = (conn.execute("SELECT rec_id FROM burn_record WHERE plan_id=? AND disk_no=? AND copy_no=?",
+                        (pid, disk_no, copy_no)).fetchone() if copy_no else
+           conn.execute("SELECT rec_id FROM burn_record WHERE plan_id=? AND disk_no=? ORDER BY copy_no DESC LIMIT 1",
+                        (pid, disk_no)).fetchone())
+    if rec is None:
+        record_burn(conn, plan, disk_no, copy_no, note="검증 시 자동 생성")
+        rec = conn.execute("SELECT rec_id FROM burn_record WHERE plan_id=? AND disk_no=? ORDER BY copy_no DESC LIMIT 1",
+                           (pid, disk_no)).fetchone()
+    prev = conn.execute("SELECT verify_result FROM burn_record WHERE rec_id=?", (rec[0],)).fetchone()[0]
+    if not (res["ok"] and not full and prev == "전체일치"):    # 빠른 검사가 앞선 전체 일치 기록을 덮지 않게
+        conn.execute("UPDATE burn_record SET verified_at=?, verify_result=? WHERE rec_id=?",
+                     (now(), verdict, rec[0]))
+    log_event(conn, plan, disk_no, f"미디어 비교 {mode}: {verdict}", f"{summarize_compare(res)} | 미디어 {media_dir}")
+    status = conn.execute("SELECT status FROM disk WHERE plan_id=? AND disk_no=?", (pid, disk_no)).fetchone()[0]
+    if res["ok"] and full:
+        set_status(conn, plan, disk_no, "검증됨", log=False)
+    elif not res["ok"] and status == "검증됨":
+        # 다른 사본 중 전체 일치한 것이 없으면 '완료'로 되돌린다
+        if not conn.execute("SELECT 1 FROM burn_record WHERE plan_id=? AND disk_no=? AND verify_result='전체일치'",
+                            (pid, disk_no)).fetchone():
+            set_status(conn, plan, disk_no, "완료", note=None, log=False)
+            log_event(conn, plan, disk_no, "상태 강등", "'검증됨' → '완료' (최근 비교 불일치, 일치한 다른 사본 없음)")
+    conn.commit()
+    res["verdict"] = verdict
+    return res
 
 
 # ---------------------------------------------------------------- export
@@ -471,6 +663,7 @@ def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None):
         w = csv.writer(fh)
         w.writerow(["disk", "rel_path", "size_bytes"])
         w.writerows((name, rel, size) for rel, size in files)
+    log_event(conn, plan, disk_no, "스테이징 내보냄", f"{dest} (파일 {len(files):,}개, 새 링크 {made:,}개)")
     return dest, csv_path, made
 
 
@@ -489,8 +682,8 @@ def verify_disk(conn, plan, disk_no, disc_root):
     extra = sorted(set(found) - set(expected))
     diff = sorted(r for r in set(expected) & set(found) if expected[r] != found[r])
     ok = not (missing or extra or diff)
-    if ok:
-        set_status(conn, plan, disk_no, "검증됨")
+    log_event(conn, plan, disk_no, "경로·크기 검증(DB 기준)" + (": 일치" if ok else ": 불일치"),
+              f"누락 {len(missing)}, 추가 {len(extra)}, 크기다름 {len(diff)} | {disc_root}")
     return ok, missing, extra, diff
 
 
@@ -544,7 +737,21 @@ def main(argv=None):
     p.add_argument("--disks", nargs="*", type=int); p.add_argument("--no-hardlink", action="store_true")
     p = sub.add_parser("status", help="디스크 상태 변경")
     p.add_argument("name"); p.add_argument("disk", type=int); p.add_argument("status", choices=STATUSES)
-    p = sub.add_parser("verify", help="굽기 후 경로·크기 대조(해시 없음)")
+    p = sub.add_parser("record", help="백업 완료 기록(사본 번호·미디어 ID·보관 위치) → 상태 '완료'")
+    p.add_argument("name"); p.add_argument("disk", type=int)
+    p.add_argument("--copy", type=int, help="사본 번호(생략 시 자동)")
+    p.add_argument("--media", default="", help="미디어 ID/시리얼/라벨")
+    p.add_argument("--location", default="", help="보관 위치")
+    p.add_argument("--note", default="")
+    p = sub.add_parser("history", help="이력과 사본 기록 보기")
+    p.add_argument("name"); p.add_argument("--disk", type=int)
+    p = sub.add_parser("compare", help="스테이징(원본)↔미디어 일치 검사. 전체(바이트) 일치 시 '검증됨'")
+    p.add_argument("name"); p.add_argument("disk", type=int)
+    p.add_argument("--stage", required=True, help="내보내기 때 지정한 스테이징 루트(그 아래 diskNN)")
+    p.add_argument("--media", required=True, help="미디어(굽은 디스크) 드라이브/경로")
+    p.add_argument("--quick", action="store_true", help="내용 비교 없이 존재·크기만 확인")
+    p.add_argument("--copy", type=int, help="결과를 붙일 사본 번호(생략 시 최근 사본)")
+    p = sub.add_parser("verify", help="경로·크기를 DB 와 대조(내용 비교 아님)")
     p.add_argument("name"); p.add_argument("disk", type=int); p.add_argument("path")
     a = ap.parse_args(argv)
 
@@ -625,6 +832,35 @@ def main(argv=None):
             print(f"disk{n:02d}: {dest} (링크 {made}개), {csvp}")
     elif a.cmd == "status":
         set_status(conn, plan, a.disk, a.status); print("변경됨")
+    elif a.cmd == "record":
+        c = record_burn(conn, plan, a.disk, a.copy, a.media, a.location, a.note)
+        print(f"disk{a.disk:02d} 사본 {c} 백업 완료 기록됨")
+    elif a.cmd == "history":
+        for rec in burn_records(conn, plan, a.disk):
+            _id, dn, cp, mid, loc, bat, vat, vres, note = rec
+            print(f"[사본] disk{dn:02d} #{cp}  미디어 {mid or '-'}  보관 {loc or '-'}  구움 {bat}  "
+                  f"검증 {vat or '-'} {vres or ''}" + (f"  ({note})" if note else ""))
+        for at, dn, ev, detail in history(conn, plan, a.disk):
+            print(f"{at}  {'계획' if dn == 0 else f'disk{dn:02d}'}  {ev}" + (f"  — {detail}" if detail else ""))
+    elif a.cmd == "compare":
+        stage_dir = os.path.join(a.stage, f"disk{a.disk:02d}")
+        last = [0.0]
+
+        def prog(f, t, b):
+            if time.time() - last[0] > 0.5:
+                last[0] = time.time()
+                print(f"\r비교 {f:,}/{t:,}개  {fmt(b)}", end="", file=sys.stderr)
+        res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog)
+        print(f"\n{res['verdict']}: {summarize_compare(res)}")
+        for key, label in (("missing", "미디어에 없음"), ("extra", "미디어에만 있음"), ("content_diff", "내용 다름"),
+                           ("hidden_missing", "숨김/시스템(미포함)")):
+            for r in res[key][:30]:
+                print(f"  {label}: {r}")
+        for r, ss, ds in res["size_diff"][:30]:
+            print(f"  크기 다름: {r} (스테이징 {ss:,} / 미디어 {ds:,})")
+        for r, e in res["read_errors"][:30]:
+            print(f"  읽기 오류: {r} ({e})")
+        sys.exit(0 if res["ok"] else 1)
     elif a.cmd == "verify":
         ok, miss, extra, diff = verify_disk(conn, plan, a.disk, a.path)
         print("일치" if ok else f"불일치: 누락 {len(miss)}, 추가 {len(extra)}, 크기다름 {len(diff)}")
