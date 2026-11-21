@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS assignment(
   PRIMARY KEY(plan_id, file_id));
 CREATE TABLE IF NOT EXISTS warning(
   plan_id INTEGER, file_id INTEGER, kind TEXT, message TEXT);
+CREATE TABLE IF NOT EXISTS disk_capacity(
+  plan_id INTEGER, disk_no INTEGER, capacity_bytes INTEGER, PRIMARY KEY(plan_id, disk_no));
 """
 
 STATUSES = ["계획됨", "굽는 중", "완료", "검증됨"]
@@ -71,6 +73,44 @@ def get_plan(conn, name):
     if not row:
         raise SystemExit(f"계획 '{name}' 이(가) 없습니다.")
     return dict(zip(("plan_id", "root", "capacity", "overhead", "name"), row))
+
+
+# ---------------------------------------------------------------- per-disk capacity
+def get_capacities(conn, plan):
+    """디스크별로 따로 지정한 용량 {disk_no: bytes}. 없는 디스크는 계획 기본 용량."""
+    return dict(conn.execute("SELECT disk_no, capacity_bytes FROM disk_capacity WHERE plan_id=?",
+                             (plan["plan_id"],)).fetchall())
+
+
+def capacity_of(caps, plan, disk_no):
+    return caps.get(disk_no, plan["capacity"])
+
+
+def set_capacity(conn, plan, disk_no, capacity_bytes):
+    """한 디스크의 용량 지정. capacity_bytes=None 이면 기본 용량으로 되돌림."""
+    if capacity_bytes is None:
+        conn.execute("DELETE FROM disk_capacity WHERE plan_id=? AND disk_no=?", (plan["plan_id"], disk_no))
+    else:
+        if capacity_bytes <= 0:
+            raise SystemExit("디스크 용량은 0보다 커야 합니다.")
+        conn.execute("INSERT OR REPLACE INTO disk_capacity VALUES(?,?,?)",
+                     (plan["plan_id"], disk_no, int(capacity_bytes)))
+    conn.commit()
+
+
+def set_capacities(conn, plan, values):
+    """values: disk01 부터 순서대로의 용량(바이트) 목록. None 은 기본 용량. 기존 지정은 모두 교체."""
+    conn.execute("DELETE FROM disk_capacity WHERE plan_id=?", (plan["plan_id"],))
+    for i, v in enumerate(values, 1):
+        if v is not None:
+            if v <= 0:
+                raise SystemExit("디스크 용량은 0보다 커야 합니다.")
+            conn.execute("INSERT INTO disk_capacity VALUES(?,?,?)", (plan["plan_id"], i, int(v)))
+    conn.commit()
+
+
+def max_capacity(caps, plan):
+    return max([plan["capacity"], *caps.values()])
 
 
 def create_plan(conn, name, root, capacity=DEFAULT_CAPACITY, overhead=0):
@@ -134,10 +174,11 @@ def scan(conn, plan, progress=None):
         conn.executemany("INSERT INTO file_info(plan_id, folder_seq, rel_path, size_bytes, mtime) "
                          "VALUES(?,?,?,?,?)", batch)
         conn.commit()
-    # 선경고: 0바이트, 디스크 용량 초과 파일
+    # 선경고: 0바이트, 디스크 용량 초과 파일(가장 큰 디스크 기준)
+    biggest = max_capacity(get_capacities(conn, plan), plan)
     for fid, rel, size in conn.execute(
             "SELECT file_id, rel_path, size_bytes FROM file_info WHERE plan_id=? AND "
-            "(size_bytes=0 OR size_bytes>?)", (pid, plan["capacity"])).fetchall():
+            "(size_bytes=0 OR size_bytes>?)", (pid, biggest)).fetchall():
         if size == 0:
             _warn(conn, pid, fid, "zero", f"0바이트 파일: {rel}")
         else:
@@ -159,13 +200,30 @@ def estimate_disks(total_bytes, capacity=DEFAULT_CAPACITY):
 
 # ---------------------------------------------------------------- allocate
 def allocate(conn, plan):
-    """목록 순서 → 폴더 내 경로 자연정렬 순으로 90G 단위 채움. 파일은 쪼개지 않음."""
-    pid, cap, ovh = plan["plan_id"], plan["capacity"], plan["overhead"]
+    """목록 순서 → 폴더 내 경로 자연정렬 순으로 디스크를 채움. 파일은 쪼개지 않음.
+    디스크마다 용량이 다를 수 있다(disk_capacity). 지정이 없는 디스크는 계획 기본 용량.
+    재배정 시 구성이 그대로인 디스크는 상태(완료/검증됨 등)를 유지하고, 바뀐 디스크만 '계획됨'으로 초기화한다."""
+    pid, ovh = plan["plan_id"], plan["overhead"]
+    caps = get_capacities(conn, plan)
+    default = plan["capacity"]
+
+    # 이전 배정 스냅샷(상태 보존용)
+    old_members = {}
+    for fid, no in conn.execute("SELECT file_id, disk_no FROM assignment WHERE plan_id=? "
+                                "ORDER BY disk_no, order_in_disk", (pid,)):
+        old_members.setdefault(no, []).append(fid)
+    old_state = {r[0]: r[1:] for r in conn.execute(
+        "SELECT disk_no, status, burned_at, verified_at, note FROM disk WHERE plan_id=?", (pid,))}
+
     conn.execute("DELETE FROM assignment WHERE plan_id=?", (pid,))
     conn.execute("DELETE FROM disk WHERE plan_id=?", (pid,))
-    conn.execute("DELETE FROM warning WHERE plan_id=? AND kind='unassigned'", (pid,))
-    disk_no, used, count, order = 0, 0, 0, 0
-    disks = {}
+    conn.execute("DELETE FROM warning WHERE plan_id=? AND kind IN ('unassigned','emptydisk','changed')", (pid,))
+
+    disk_no = used = count = order = 0
+    disks, members = {}, {}
+
+    def cap_of(n):
+        return caps.get(n, default)
 
     def open_disk():
         nonlocal disk_no, used, count, order
@@ -173,6 +231,7 @@ def allocate(conn, plan):
             disks[disk_no] = (used, count)
         disk_no += 1
         used = count = order = 0
+        members[disk_no] = []
 
     for seq, in conn.execute("SELECT seq FROM selected_folder WHERE plan_id=? ORDER BY seq", (pid,)).fetchall():
         files = conn.execute("SELECT file_id, rel_path, size_bytes FROM file_info "
@@ -180,22 +239,47 @@ def allocate(conn, plan):
         files.sort(key=lambda r: natural_key(r[1]))
         for fid, rel, size in files:
             cost = size + ovh
-            if cost > cap:
-                _warn(conn, pid, fid, "unassigned", f"배정 불가(용량 초과): {rel}")
-                continue
-            if disk_no == 0 or used + cost > cap:
+            if disk_no == 0:
                 open_disk()
-            used += cost
-            count += 1
-            order += 1
-            conn.execute("INSERT INTO assignment VALUES(?,?,?,?)", (pid, fid, disk_no, order))
+            while used + cost > cap_of(disk_no):
+                # 이후 디스크(번호가 더 큰 것) 중 이 파일을 담을 수 있는 곳이 있어야 계속 진행
+                later = max([default] + [c for n, c in caps.items() if n > disk_no])
+                if cost > later:
+                    _warn(conn, pid, fid, "unassigned",
+                          f"배정 불가(어느 디스크에도 들어가지 않음, {size / GB:.2f} GB): {rel}")
+                    break
+                open_disk()
+            else:
+                used += cost
+                count += 1
+                order += 1
+                members[disk_no].append(fid)
+                conn.execute("INSERT INTO assignment VALUES(?,?,?,?)", (pid, fid, disk_no, order))
     if disk_no:
         disks[disk_no] = (used, count)
+
     for n, (u, c) in disks.items():
         conn.execute("INSERT INTO disk(plan_id, disk_no, disk_name, volume_label, used_bytes, file_count) "
                      "VALUES(?,?,?,?,?,?)", (pid, n, f"disk{n:02d}", f"{plan['name']}_disk{n:02d}", u, c))
+        if c == 0:
+            _warn(conn, pid, None, "emptydisk",
+                  f"disk{n:02d}: 용량({cap_of(n) / GB:.2f} GB)이 작아 배정된 파일이 없습니다.")
+        prev = old_state.get(n)
+        if prev and prev[0] != STATUSES[0]:
+            if old_members.get(n) == members.get(n):      # 구성 동일 → 상태 유지
+                conn.execute("UPDATE disk SET status=?, burned_at=?, verified_at=?, note=? "
+                             "WHERE plan_id=? AND disk_no=?", (*prev, pid, n))
+            else:
+                _warn(conn, pid, None, "changed",
+                      f"disk{n:02d}: 이미 '{prev[0]}' 상태였으나 구성이 바뀌어 '계획됨'으로 초기화됨 — 다시 구워야 합니다.")
     conn.commit()
     return disks
+
+
+def locked_disks(conn, plan):
+    """'계획됨'이 아닌(이미 굽기 시작/완료/검증된) 디스크 번호."""
+    return [r[0] for r in conn.execute(
+        "SELECT disk_no FROM disk WHERE plan_id=? AND status<>? ORDER BY disk_no", (plan["plan_id"], STATUSES[0]))]
 
 
 # ---------------------------------------------------------------- queries
@@ -266,7 +350,8 @@ def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None):
                        (plan["plan_id"], disk_no)).fetchone()
     split = {f: d for f, d in split_folders(conn, plan)}
     with open(os.path.join(dest, "INDEX.txt"), "w", encoding="utf-8-sig") as fh:
-        fh.write(f"{row[0]}  ({name})\n파일 {row[2]:,}개 / {row[1] / GB:.2f} GB\n\n[포함 폴더]\n")
+        cap = capacity_of(get_capacities(conn, plan), plan, disk_no)
+        fh.write(f"{row[0]}  ({name})\n파일 {row[2]:,}개 / {row[1] / GB:.2f} GB (디스크 용량 기준 {cap / GB:.2f} GB)\n\n[포함 폴더]\n")
         for folder, cnt, size in disk_folders(conn, plan, disk_no):
             mark = f"  ※ 분할 폴더(디스크 {split[folder]} 에 나뉨)" if folder in split else ""
             fh.write(f"- {folder}  {cnt:,}개  {size / GB:.2f} GB{mark}\n")
@@ -310,8 +395,11 @@ def cmd_show(conn, plan):
     rows = conn.execute("SELECT disk_no, disk_name, used_bytes, file_count, status FROM disk "
                         "WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],)).fetchall()
     split = dict(split_folders(conn, plan))
+    caps = get_capacities(conn, plan)
     for no, name, used, cnt, st in rows:
-        print(f"{name} [{st}] {fmt(used)} / {fmt(plan['capacity'])}  파일 {cnt:,}")
+        cap = capacity_of(caps, plan, no)
+        mark = "" if no not in caps else " (지정)"
+        print(f"{name} [{st}] {fmt(used)} / {fmt(cap)}{mark}  파일 {cnt:,}")
         for folder, c, size in disk_folders(conn, plan, no):
             mark = f"  (분할: 디스크 {split[folder]})" if folder in split else ""
             print(f"    {folder}  {c:,}개  {fmt(size)}{mark}")
@@ -333,6 +421,12 @@ def main(argv=None):
     p.add_argument("name"); p.add_argument("folders", nargs="+")
     p = sub.add_parser("scan", help="스캔 후 배정 계산"); p.add_argument("name")
     p = sub.add_parser("show", help="배정 결과"); p.add_argument("name")
+    p = sub.add_parser("capacity", help="디스크별 용량 지정/조회 (예: capacity 계획 1=95 2=23.3 --binary)")
+    p.add_argument("name"); p.add_argument("items", nargs="*", help="번호=용량  (용량 'default' 는 기본값으로)")
+    p.add_argument("--binary", action="store_true", help="용량을 GiB(이진)로 해석")
+    p.add_argument("--clear", action="store_true", help="지정을 모두 지우고 기본 용량으로")
+    p = sub.add_parser("allocate", help="스캔 없이 현재 용량 설정으로 다시 배정")
+    p.add_argument("name")
     p = sub.add_parser("export", help="하드링크 스테이징 + INDEX + CSV")
     p.add_argument("name"); p.add_argument("--stage", required=True)
     p.add_argument("--disks", nargs="*", type=int); p.add_argument("--no-hardlink", action="store_true")
@@ -367,6 +461,27 @@ def main(argv=None):
         print(f"배정 완료: {len(d)}장")
     elif a.cmd == "show":
         cmd_show(conn, plan)
+    elif a.cmd == "capacity":
+        unit = GIB if a.binary else GB
+        if a.clear:
+            set_capacities(conn, plan, [])
+        for it in a.items:
+            no, _, val = it.partition("=")
+            if not no.isdigit() or not val:
+                raise SystemExit(f"형식은 번호=용량 입니다: {it}")
+            set_capacity(conn, plan, int(no), None if val == "default" else int(float(val) * unit))
+        caps = get_capacities(conn, plan)
+        print(f"기본 용량 {fmt(plan['capacity'])}")
+        for n in sorted(caps):
+            print(f"  disk{n:02d}: {fmt(caps[n])}")
+        if a.items or a.clear:
+            print("※ 적용하려면 scan(재스캔+배정) 또는 allocate(재배정)을 실행하세요.")
+    elif a.cmd == "allocate":
+        d = allocate(conn, plan)
+        print(f"재배정 완료: {len(d)}장")
+        for kind, msg in conn.execute("SELECT kind, message FROM warning WHERE plan_id=? AND kind IN "
+                                      "('unassigned','emptydisk','changed')", (plan["plan_id"],)):
+            print(f"[경고:{kind}] {msg}")
     elif a.cmd == "export":
         nos = a.disks or [r[0] for r in conn.execute(
             "SELECT disk_no FROM disk WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],))]

@@ -51,6 +51,11 @@ class App(tk.Tk):
         ttk.Label(top, text="※ 파일 1개마다 용량에 더해 계산(UDF 메타데이터·섹터 올림 보정). 0이면 사용 안 함.",
                   foreground="#555").grid(row=1, column=0, columnspan=5, sticky="w", **pad)
         ttk.Button(top, text="폴더 목록 읽기", command=self.load_folders).grid(row=0, column=8, **pad)
+        ttk.Label(top, text="디스크별 용량").grid(row=2, column=0, **pad)
+        self.caps_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.caps_var, width=34).grid(row=2, column=1, columnspan=4, sticky="we", **pad)
+        ttk.Label(top, text="※ disk01부터 쉼표로 구분(위 단위). 예: 95, 23.3, , 45  → 비운 칸·나머지는 기본 용량",
+                  foreground="#555").grid(row=2, column=5, columnspan=4, sticky="w", **pad)
 
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -77,9 +82,10 @@ class App(tk.Tk):
 
         right = ttk.LabelFrame(body, text="④ 디스크 배정 결과")
         body.add(right, weight=2)
-        self.dtree = ttk.Treeview(right, columns=("disk", "st", "used", "pct", "cnt", "folders"),
+        self.dtree = ttk.Treeview(right, columns=("disk", "st", "cap", "used", "pct", "cnt", "folders"),
                                   show="headings", selectmode="extended", height=12)
-        for c, t, w, a in (("disk", "디스크", 70, "w"), ("st", "상태", 70, "w"), ("used", "사용(GB)", 80, "e"),
+        for c, t, w, a in (("disk", "디스크", 70, "w"), ("st", "상태", 70, "w"), ("cap", "용량(GB)", 80, "e"),
+                           ("used", "사용(GB)", 80, "e"),
                            ("pct", "채움", 55, "e"), ("cnt", "파일수", 70, "e"), ("folders", "포함 폴더", 360, "w")):
             self.dtree.heading(c, text=t)
             self.dtree.column(c, width=w, anchor=a, stretch=(c == "folders"))
@@ -97,6 +103,16 @@ class App(tk.Tk):
                      state="readonly").pack(side="left", padx=4)
         ttk.Button(act, text="변경", command=self.change_status).pack(side="left")
         ttk.Button(act, text="굽기 후 검증…", command=self.run_verify).pack(side="left", padx=12)
+
+        cap = ttk.Frame(right)
+        cap.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(cap, text="선택 디스크 용량:").pack(side="left")
+        self.cap_one_var = tk.StringVar()
+        ttk.Entry(cap, textvariable=self.cap_one_var, width=8).pack(side="left", padx=4)
+        ttk.Label(cap, text="(위 단위)").pack(side="left")
+        ttk.Button(cap, text="적용 후 재배정", command=self.apply_disk_capacity).pack(side="left", padx=6)
+        ttk.Button(cap, text="기본 용량으로", command=lambda: self.apply_disk_capacity(reset=True)).pack(side="left")
+        ttk.Button(cap, text="재배정", command=self.run_realloc).pack(side="left", padx=12)
 
         out = ttk.LabelFrame(right, text="⑤ 출력 (하드링크 스테이징 + INDEX.txt + 목록 CSV)")
         out.pack(fill="x", padx=4, pady=4)
@@ -137,6 +153,42 @@ class App(tk.Tk):
         except ValueError:
             raise ValueError("디스크 용량은 숫자여야 합니다.")
         return int(v * (core.GIB if self.unit_var.get().startswith("GiB") else core.GB))
+
+    def unit_bytes(self):
+        return core.GIB if self.unit_var.get().startswith("GiB") else core.GB
+
+    def parse_caps(self):
+        """'95, 23.3, , 45' → [bytes, bytes, None, bytes]"""
+        out = []
+        for tok in self.caps_var.get().replace("，", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                out.append(None)
+                continue
+            try:
+                v = float(tok)
+            except ValueError:
+                raise ValueError(f"디스크별 용량에 숫자가 아닌 값이 있습니다: '{tok}'")
+            if v <= 0:
+                raise ValueError("디스크별 용량은 0보다 커야 합니다.")
+            out.append(int(v * self.unit_bytes()))
+        while out and out[-1] is None:
+            out.pop()
+        return out
+
+    def sync_caps_entry(self):
+        """DB 의 디스크별 용량 지정을 입력칸에 반영."""
+        if not self.plan:
+            return
+        caps = core.get_capacities(self.conn, self.plan)
+        if not caps:
+            self.caps_var.set("")
+            return
+        u = self.unit_bytes()
+        vals = []
+        for n in range(1, max(caps) + 1):
+            vals.append(f"{caps[n] / u:.6g}" if n in caps else "")
+        self.caps_var.set(", ".join(vals))
 
     def overhead(self):
         try:
@@ -197,6 +249,7 @@ class App(tk.Tk):
             self.ftree.insert("", "end", values=(CHECK if f in saved else UNCHECK, "", f,
                                                  f"{cnt:,}" if cnt else "", core.fmt(size) if size else ""))
         self.renumber()
+        self.sync_caps_entry()
         self.refresh_disks()
         self.say(f"원본: {plan['root']}  (하부 폴더 {len(subs)}개)")
 
@@ -298,6 +351,11 @@ class App(tk.Tk):
                 messagebox.showerror("오류", str(e))
             return
         core.set_folders(self.conn, plan, names)
+        try:
+            core.set_capacities(self.conn, plan, self.parse_caps())   # 입력칸 = 디스크별 용량(스캔 시 저장)
+        except ValueError as e:
+            messagebox.showerror("오류", str(e))
+            return
 
         def fn(conn):
             p = core.get_plan(conn, plan["name"])
@@ -309,12 +367,12 @@ class App(tk.Tk):
             n, b, nd = res
             dec, bi = core.estimate_disks(b, plan["capacity"])
             self.say(f"스캔 완료: 파일 {n:,}개, {core.fmt(b)}")
-            self.say(f"예상 디스크 수: 용량을 십진 기준으로 {dec}장 / 이진 기준으로 {bi}장 → 실제 배정 {nd}장")
+            self.say(f"예상 디스크 수(기본 용량 기준): 십진 {dec}장 / 이진 {bi}장 → 디스크별 용량 반영 실제 배정 {nd}장")
             self.scan_sum = f"선택 {len(names)}개 · {n:,}개 파일 · {core.fmt(b)} · 배정 {nd}장"
             self.sum_var.set(self.scan_sum)
             self.load_folders()
             over = self.conn.execute("SELECT message FROM warning WHERE plan_id=? AND kind IN "
-                                     "('oversize','unassigned','access')", (plan["plan_id"],)).fetchall()
+                                     "('oversize','unassigned','access','emptydisk','changed')", (plan["plan_id"],)).fetchall()
             for (m,) in over:
                 self.say(f"[경고] {m}")
             if over:
@@ -331,21 +389,80 @@ class App(tk.Tk):
             return
         plan = self.plan
         split = dict(core.split_folders(self.conn, plan))
+        caps = core.get_capacities(self.conn, plan)
         for no, name, used, cnt, st in self.conn.execute(
                 "SELECT disk_no, disk_name, used_bytes, file_count, status FROM disk "
                 "WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],)).fetchall():
             parts = []
             for folder, c, size in core.disk_folders(self.conn, plan, no):
                 parts.append(f"{folder} {size / core.GB:.1f}G" + ("◀▶" if folder in split else ""))
+            cap = core.capacity_of(caps, plan, no)
             self.dtree.insert("", "end", iid=str(no), tags=(st,), values=(
-                name, st, f"{used / core.GB:.2f}", f"{used * 100 / plan['capacity']:.0f}%", f"{cnt:,}",
+                name, st, f"{cap / core.GB:.2f}" + ("*" if no in caps else ""),
+                f"{used / core.GB:.2f}", f"{used * 100 / cap:.0f}%", f"{cnt:,}",
                 " · ".join(parts)))
         again = [i for i in self._restore_sel if self.dtree.exists(i)]
         if again:
             self.dtree.selection_set(again)
 
     def on_disk_select(self, _ev):
-        pass
+        sel = self.selected_disks()
+        if len(sel) == 1 and self.plan:
+            cap = core.capacity_of(core.get_capacities(self.conn, self.plan), self.plan, sel[0])
+            v = cap / self.unit_bytes()
+            self.cap_one_var.set(f"{v:.6g}")
+
+    # ------------------------------------------------------------ per-disk capacity
+    def apply_disk_capacity(self, reset=False):
+        nos = self.selected_disks()
+        if not nos or not self.plan:
+            messagebox.showinfo("선택 없음", "용량을 바꿀 디스크를 선택하세요.")
+            return
+        try:
+            val = None if reset else float(self.cap_one_var.get())
+            if val is not None and val <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("오류", "용량은 0보다 큰 숫자여야 합니다.")
+            return
+        for n in nos:
+            core.set_capacity(self.conn, self.plan, n, None if val is None else int(val * self.unit_bytes()))
+        self.sync_caps_entry()
+        self.run_realloc(changed=min(nos))
+
+    def run_realloc(self, changed=None):
+        """스캔 없이 현재 용량 설정으로 다시 배정."""
+        if not self.plan:
+            messagebox.showinfo("확인", "먼저 스캔 + 배정 계산을 실행하세요.")
+            return
+        plan = self.plan
+        if not self.conn.execute("SELECT 1 FROM file_info WHERE plan_id=? LIMIT 1", (plan["plan_id"],)).fetchone():
+            messagebox.showinfo("확인", "스캔 결과가 없습니다. 먼저 스캔 + 배정 계산을 실행하세요.")
+            return
+        try:
+            core.set_capacities(self.conn, plan, self.parse_caps())
+        except ValueError as e:
+            messagebox.showerror("오류", str(e))
+            return
+        locked = [n for n in core.locked_disks(self.conn, plan) if changed is None or n >= changed]
+        if locked and not messagebox.askyesno(
+                "이미 구운 디스크",
+                "다음 디스크는 '계획됨'이 아닙니다: " + ", ".join(f"disk{n:02d}" for n in locked) +
+                "\n용량 변경으로 구성이 바뀌면 해당 디스크 상태가 '계획됨'으로 초기화됩니다.\n"
+                "(구성이 그대로인 디스크는 상태가 유지됩니다.) 계속할까요?"):
+            return
+
+        def fn(conn):
+            p = core.get_plan(conn, plan["name"])
+            return len(core.allocate(conn, p))
+
+        def done(nd):
+            self.say(f"재배정 완료: {nd}장")
+            for (m,) in self.conn.execute("SELECT message FROM warning WHERE plan_id=? AND kind IN "
+                                          "('unassigned','emptydisk','changed')", (plan["plan_id"],)):
+                self.say(f"[경고] {m}")
+            self.refresh_disks()
+        self.run_bg(fn, done, "재배정 중…")
 
     def selected_disks(self):
         return [int(i) for i in self.dtree.selection()]
