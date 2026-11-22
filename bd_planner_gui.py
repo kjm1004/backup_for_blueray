@@ -166,7 +166,13 @@ class App(tk.Tk):
         self.log = tk.Text(right, height=9, wrap="word")
         self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.status = tk.StringVar(value="준비")
-        ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w").pack(fill="x", side="bottom")
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", side="bottom")
+        self.pct_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.pct_var, width=7, anchor="e").pack(side="right", padx=(0, 6))
+        self.pbar = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=100)
+        self.pbar.pack(side="right", padx=4, pady=2)
+        ttk.Label(bar, textvariable=self.status, relief="sunken", anchor="w").pack(side="left", fill="x", expand=True)
 
     # ------------------------------------------------------------ helpers
     def say(self, msg):
@@ -337,8 +343,14 @@ class App(tk.Tk):
                 if kind == "prog":
                     self.status.set(res)
                     continue
+                if kind == "pct":
+                    self.pbar["value"] = res
+                    self.pct_var.set(f"{res:.1f}%")
+                    continue
                 self.busy = False
                 self.status.set("준비")
+                self.pbar["value"] = 0
+                self.pct_var.set("")
                 if kind == "err":
                     self.say(f"[오류] {res}")
                     messagebox.showerror("오류", str(res))
@@ -804,6 +816,18 @@ class App(tk.Tk):
         self.wait_window(win)
         return out if out.get("_ok") else None
 
+    def post_progress(self, label, p, last):
+        """compare/copy 진행 정보(dict)를 하단 표시줄(파일명·건수·용량)과 진행 막대로 보낸다(0.3초마다)."""
+        if time.time() - last[0] <= 0.3:
+            return
+        last[0] = time.time()
+        step = p.get("step")
+        name = core.short_name(p.get("file", ""), 70)
+        text = (f"{label}" + (f" [{step}]" if step else "") + f" · {p['files_done']:,}/{p['files_total']:,}개 · "
+                f"{core.fmt(p['bytes_done'])} · {name}")
+        self.q.put(("prog", None, text))
+        self.q.put(("pct", None, p["percent"]))
+
     def one_disk(self):
         nos = self.selected_disks()
         if len(nos) != 1 or not self.plan:
@@ -853,10 +877,8 @@ class App(tk.Tk):
         last = [0.0]
 
         def fn(conn):
-            def prog(f, t, b):
-                if time.time() - last[0] > 0.3:
-                    last[0] = time.time()
-                    self.q.put(("prog", None, f"비교 중… {f:,}/{t:,}개 · {core.fmt(b)}"))
+            def prog(p):
+                self.post_progress("미디어 비교 중", p, last)
             return core.verify_media(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, full, None, prog)
 
         def done(res):
@@ -908,10 +930,8 @@ class App(tk.Tk):
         last = [0.0]
 
         def fn(conn):
-            def prog(phase, f, t, b):
-                if time.time() - last[0] > 0.3:
-                    last[0] = time.time()
-                    self.q.put(("prog", None, f"{'복사' if phase == 'copy' else '비교'} 중… {f:,}/{t:,}개 · {core.fmt(b)}"))
+            def prog(p):
+                self.post_progress("복사 후 비교 중", p, last)
             return core.verify_via_copy(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, temp,
                                         None, delete_ok, prog)
 

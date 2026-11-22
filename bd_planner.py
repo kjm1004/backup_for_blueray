@@ -783,17 +783,30 @@ def compare_dirs(src, dst, full=True, progress=None):
     """스테이징 폴더(src)와 미디어(dst)를 대조한다.
     full=True 면 모든 파일을 바이트 단위로 비교, False 면 존재·크기만(빠른 검사).
     숨김/시스템 파일이 미디어에 없는 것은 실패로 치지 않고 따로 보고한다(ImgBurn 이 기본 제외).
-    progress(done_files, total_files, done_bytes) 를 주기적으로 호출."""
+    progress(info) 를 주기적으로 호출. info: phase, file(현재 파일), files_done, files_total, bytes_done, bytes_total, percent."""
     a, b = _walk_files(src), _walk_files(dst)
+    total_b = 0
+    for _k, (_r, _p) in a.items():
+        try:
+            total_b += os.path.getsize(_p)
+        except OSError:
+            pass
     res = {"total": len(a), "matched": 0, "bytes": 0, "missing": [], "hidden_missing": [], "extra": [],
            "size_diff": [], "content_diff": [], "read_errors": [], "full": full}
     done_b = [0]
     done_f = 0
+
+    def report(rel):
+        if progress:
+            by_bytes = full and total_b > 0
+            pct = (100.0 * done_b[0] / total_b) if by_bytes else (100.0 * (done_f - 1) / len(a) if a else 100.0)
+            progress({"phase": "compare", "file": rel, "files_done": done_f, "files_total": len(a),
+                      "bytes_done": done_b[0], "bytes_total": total_b, "percent": min(pct, 100.0)})
+
     for key in sorted(a, key=lambda k: natural_key(a[k][0])):
         rel, sp = a[key]
         done_f += 1
-        if progress:
-            progress(done_f, len(a), done_b[0])
+        report(rel)
         if key not in b:
             (res["hidden_missing"] if _is_hidden_or_system(sp) else res["missing"]).append(rel)
             continue
@@ -804,10 +817,9 @@ def compare_dirs(src, dst, full=True, progress=None):
                 res["size_diff"].append((rel, ss, ds))
                 continue
             if full:
-                def tick(n):
+                def tick(n, rel=rel):
                     done_b[0] += n
-                    if progress:
-                        progress(done_f, len(a), done_b[0])
+                    report(rel)
                 if not _same_content(sp, dp, tick):
                     res["content_diff"].append(rel)
                     continue
@@ -893,7 +905,8 @@ def _related(a, b):
 
 def copy_media(src, dst, progress=None):
     """미디어(src)의 모든 파일을 dst 로 복사한다. 읽기 실패는 파일별로 모아 두고 계속 진행한다(중단하지 않음).
-    progress(done_files, total_files, done_bytes, total_bytes). 복사 실패 [(rel, 오류)], 복사한 바이트를 반환."""
+    progress(info): phase='copy', file, files_done, files_total, bytes_done, bytes_total, percent.
+    복사 실패 [(rel, 오류)], 복사한 바이트를 반환."""
     base = long_path(src)
     files, total = [], 0
     for d, dirs, fs in os.walk(base):
@@ -911,6 +924,13 @@ def copy_media(src, dst, progress=None):
         raise SystemExit(f"임시 위치의 여유 공간이 부족합니다: 필요 {total / GB:.1f} GB, 여유 {free / GB:.1f} GB")
     errors, done_b = [], 0
     files.sort(key=lambda r: natural_key(r[0]))
+
+    def report(i, rel):
+        if progress:
+            progress({"phase": "copy", "file": rel, "files_done": i, "files_total": len(files),
+                      "bytes_done": done_b, "bytes_total": total,
+                      "percent": min(100.0 * done_b / total, 100.0) if total else 100.0 * i / len(files)})
+
     for i, (rel, full, size) in enumerate(files, 1):
         out = long_path(os.path.join(dst, rel))
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -922,8 +942,7 @@ def copy_media(src, dst, progress=None):
                         break
                     fo.write(chunk)
                     done_b += len(chunk)
-                    if progress:
-                        progress(i, len(files), done_b, total)
+                    report(i, rel)
             try:
                 shutil.copystat(full, out)
             except OSError:
@@ -936,8 +955,7 @@ def copy_media(src, dst, progress=None):
                 os.remove(out)                        # 불완전한 파일이 일치로 오인되지 않게 지운다
             except OSError:
                 pass
-        if progress:
-            progress(i, len(files), done_b, total)
+        report(i, rel)
     return errors, done_b
 
 
@@ -946,7 +964,8 @@ def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_n
     """① 미디어의 파일을 temp_root 아래 임시 폴더로 복사 → ② 복사본을 스테이징과 전체(바이트) 비교 → 이력 기록.
     임시 폴더는 temp_root/_bd_verify/<계획>_diskNN 이며, 이 프로그램이 만든 표식 파일이 있는 폴더만 지운다.
     복사 중 읽기 실패한 파일이 있으면 불일치로 판정하고 복사본은 남겨 둔다.
-    progress(phase, done_files, total_files, done_bytes) — phase 는 'copy' 또는 'compare'."""
+    progress(info) — compare_dirs/copy_media 의 info 에 step('1/2 복사'·'2/2 비교'), phase_percent 를 더하고
+    percent 는 복사+비교 전체 진행률(각 50%)로 바꿔 전달한다."""
     for p, what in ((stage_dir, "스테이징 폴더"), (media_dir, "미디어 경로"), (temp_root, "임시 위치")):
         if not p or not os.path.isdir(p):
             raise SystemExit(f"{what}에 접근할 수 없습니다: {p}")
@@ -962,11 +981,15 @@ def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_n
         fh.write(f"bd_planner temp copy of disk{disk_no:02d} {now()}\n")
 
     t0 = time.time()
-    copy_errors, copied = copy_media(media_dir, target,
-                                     (lambda f, t, b, tb: progress("copy", f, t, b)) if progress else None)
+    def stage(step, base):
+        def cb(info):
+            if progress:
+                info = dict(info, step=step, phase_percent=info["percent"], percent=base + info["percent"] / 2)
+                progress(info)
+        return cb
+    copy_errors, copied = copy_media(media_dir, target, stage("1/2 복사", 0.0))
     copy_secs = time.time() - t0
-    res = compare_dirs(stage_dir, target, True,
-                       (lambda f, t, b: progress("compare", f, t, b)) if progress else None)
+    res = compare_dirs(stage_dir, target, True, stage("2/2 비교", 50.0))
     res["extra"] = [r for r in res["extra"] if r.lower() != TMP_MARKER]      # 표식 파일은 비교 대상이 아님
     res["copy_errors"] = copy_errors
     res["ok"] = not (res["missing"] or res["extra"] or res["size_diff"] or res["content_diff"]
@@ -1050,6 +1073,14 @@ def verify_disk(conn, plan, disk_no, disc_root):
 
 
 # ---------------------------------------------------------------- CLI
+def short_name(name, width=60):
+    """긴 경로를 가운데를 줄여 표시."""
+    if len(name) <= width:
+        return name
+    keep = (width - 1) // 2
+    return name[:keep] + "…" + name[-(width - 1 - keep):]
+
+
 def fmt(b):
     return f"{b / GB:,.2f} GB"
 
@@ -1276,17 +1307,15 @@ def main(argv=None):
         stage_dir = os.path.join(a.stage, f"disk{a.disk:02d}")
         last = [0.0]
 
-        def prog(f, t, b):
+        def prog(p):
             if time.time() - last[0] > 0.5:
                 last[0] = time.time()
-                print(f"\r비교 {f:,}/{t:,}개  {fmt(b)}", end="", file=sys.stderr)
+                line = (f"{p.get('step', '비교')} {p['percent']:5.1f}%  {p['files_done']:,}/{p['files_total']:,}개  "
+                        f"{fmt(p['bytes_done'])}  {short_name(p['file'])}")
+                print(f"\r{line:<110}", end="", file=sys.stderr)
         if a.via_copy:
-            def vprog(phase, f, t, b):
-                if time.time() - last[0] > 0.5:
-                    last[0] = time.time()
-                    print(f"\r{'복사' if phase == 'copy' else '비교'} {f:,}/{t:,}개  {fmt(b)}", end="", file=sys.stderr)
             res = verify_via_copy(conn, plan, a.disk, stage_dir, a.media, a.via_copy, a.copy,
-                                  not a.keep_copy, vprog)
+                                  not a.keep_copy, prog)
         else:
             res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog)
         print(f"\n{res['verdict']}: {summarize_compare(res)}")
