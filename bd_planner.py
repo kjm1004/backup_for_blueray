@@ -12,7 +12,10 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
+import subprocess
 import sys
+import tempfile
 import time
 
 GB = 1000 ** 3
@@ -242,6 +245,13 @@ class Specs:
     def ovh(self, n):
         k = self.media_key(n)
         return self.types[k]["per_file"] if k else self.plan["overhead"]
+
+    def raw_cap(self, n):
+        """고정 오버헤드를 빼기 전의 미디어 기록 가능 용량."""
+        if n in self.custom:
+            return self.custom[n]
+        k = self.media_key(n)
+        return self.types[k]["capacity"] if k else self.plan["capacity"]
 
     def fits_later(self, n, size):
         """번호가 n 보다 큰 디스크 중(지정 디스크 + 기본 설정 디스크) 이 파일이 들어가는 곳이 있는가."""
@@ -1052,7 +1062,7 @@ def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None):
     return dest, csv_path, made
 
 
-def verify_disk(conn, plan, disk_no, disc_root):
+def verify_disk(conn, plan, disk_no, disc_root, log=True):
     """디스크(또는 스테이징 폴더)의 파일 경로·크기를 DB 와 대조. 해시는 사용하지 않는다."""
     expected = {rel: size for rel, size in disk_files(conn, plan, disk_no)}
     found = {}
@@ -1067,9 +1077,314 @@ def verify_disk(conn, plan, disk_no, disc_root):
     extra = sorted(set(found) - set(expected))
     diff = sorted(r for r in set(expected) & set(found) if expected[r] != found[r])
     ok = not (missing or extra or diff)
-    log_event(conn, plan, disk_no, "경로·크기 검증(DB 기준)" + (": 일치" if ok else ": 불일치"),
-              f"누락 {len(missing)}, 추가 {len(extra)}, 크기다름 {len(diff)} | {disc_root}")
+    if log:
+        log_event(conn, plan, disk_no, "경로·크기 검증(DB 기준)" + (": 일치" if ok else ": 불일치"),
+                  f"누락 {len(missing)}, 추가 {len(extra)}, 크기다름 {len(diff)} | {disc_root}")
     return ok, missing, extra, diff
+
+
+# ---------------------------------------------------------------- ISO (UDF 2.50) — 검증 먼저, 그다음 생성
+UDF_REV_250 = 0x250
+ISO_SECTOR = 2048
+IMAPI_UDF = 4                       # FsiFileSystemUDF
+LABEL_BAD = set(range(32)) | {127}
+
+# Windows 내장 IMAPI2FS 로 스테이징 폴더를 UDF 이미지로 저장하는 PowerShell 스크립트.
+# -ProbeOnly 는 지원하는 UDF 리비전 목록만 출력(아무것도 만들지 않음).
+ISO_SCRIPT = r"""param([string]$Src, [string]$Dest, [string]$Label, [int]$Revision = 592, [switch]$ProbeOnly)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
+  $sup = @($fsi.UDFRevisionsSupported)
+  if ($ProbeOnly) { Write-Output ("SUPPORTED:" + ($sup -join ',')); exit 0 }
+  if ($sup -notcontains $Revision) { Write-Output ("ERROR:UDF 리비전 $Revision 을(를) 지원하지 않습니다. 지원: " + ($sup -join ',')); exit 3 }
+  $fsi.FreeMediaBlocks = 0
+  $fsi.FileSystemsToCreate = 4
+  $fsi.UDFRevision = $Revision
+  $fsi.VolumeName = $Label
+  $fsi.Root.AddTree($Src, $false)
+  $res = $fsi.CreateResultImage()
+  $cs = @"
+using System; using System.IO; using System.Runtime.InteropServices; using System.Runtime.InteropServices.ComTypes;
+public class BdpIsoWriter {
+  public static void Write(string path, object stream, int blockSize, long totalBlocks) {
+    IStream s = (IStream)stream; byte[] buf = new byte[blockSize * 64]; IntPtr pRead = Marshal.AllocHGlobal(4);
+    try {
+      using (FileStream o = new FileStream(path, FileMode.CreateNew, FileAccess.Write)) {
+        long written = 0, total = totalBlocks * blockSize; int last = -1;
+        while (written < total) {
+          int want = (int)Math.Min((long)buf.Length, total - written);
+          s.Read(buf, want, pRead); int got = Marshal.ReadInt32(pRead);
+          if (got <= 0) break;
+          o.Write(buf, 0, got); written += got;
+          int pct = (int)(written * 100 / total);
+          if (pct != last) { last = pct; Console.WriteLine("PROGRESS:" + written + "," + total); }
+        }
+        if (written != total) throw new Exception("이미지 스트림이 중간에 끝났습니다: " + written + "/" + total);
+      }
+    } finally { Marshal.FreeHGlobal(pRead); }
+  }
+}
+"@
+  Add-Type -TypeDefinition $cs
+  [BdpIsoWriter]::Write($Dest, $res.ImageStream, [int]$res.BlockSize, [long]$res.TotalBlocks)
+  Write-Output ("DONE:" + $res.TotalBlocks + "," + $res.BlockSize)
+} catch {
+  Write-Output ("ERROR:" + $_.Exception.Message)
+  exit 1
+}
+"""
+
+
+def validate_label(label):
+    """UDF 볼륨 라벨 검사. 문제가 있으면 설명 문자열, 없으면 None.
+    UDF 의 볼륨 식별자(dstring 32바이트)는 8비트 문자면 최대 31자, 한글처럼 16비트가 필요하면 최대 15자."""
+    if not label or not label.strip():
+        return "라벨이 비어 있습니다."
+    if label != label.strip():
+        return "라벨 앞뒤에 공백이 있습니다."
+    if any(ord(c) in LABEL_BAD for c in label):
+        return "라벨에 제어 문자가 있습니다."
+    wide = any(ord(c) > 0xFF for c in label)
+    limit = 15 if wide else 31
+    if len(label) > limit:
+        return f"라벨이 너무 깁니다({len(label)}자). {'한글 등 16비트 문자가 있으면' if wide else '영문·숫자만이면'} 최대 {limit}자."
+    return None
+
+
+def _powershell():
+    return shutil.which("powershell.exe") or shutil.which("powershell")
+
+
+def probe_udf_revisions():
+    """IMAPI 가 지원하는 UDF 리비전 목록(정수). Windows 가 아니거나 실행할 수 없으면 None."""
+    if os.name != "nt" or not _powershell():
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        script = os.path.join(td, "iso.ps1")
+        with open(script, "w", encoding="utf-8-sig") as fh:
+            fh.write(ISO_SCRIPT)
+        try:
+            out = subprocess.run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+                                  "-ProbeOnly"], capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    for line in out.stdout.splitlines():
+        if line.startswith("SUPPORTED:"):
+            return [int(x) for x in line[10:].split(",") if x.strip().lstrip("-").isdigit()]
+    return None
+
+
+def iso_preflight(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=False, probe=True):
+    """ISO 를 쓰기 전에 하는 검증. {"ok", "checks": [(이름, True/False/None(건너뜀), 설명)], "label", "estimate", "can_build"}.
+    아무것도 쓰지 않는다. ok 가 False 면 ISO 를 만들면 안 된다."""
+    name = f"disk{disk_no:02d}"
+    label = label if label is not None else name
+    stage_dir = os.path.join(stage_root, name)
+    checks = []
+
+    def add(title, ok, msg):
+        checks.append((title, ok, msg))
+
+    row = conn.execute("SELECT used_bytes, file_count FROM disk WHERE plan_id=? AND disk_no=?",
+                       (plan["plan_id"], disk_no)).fetchone()
+    add("디스크 존재", bool(row), f"{name} 배정 있음 (파일 {row[1]:,}개)" if row else f"{name} 이(가) 배정에 없습니다.")
+    add("스테이징 폴더", os.path.isdir(stage_dir), stage_dir if os.path.isdir(stage_dir) else f"없음: {stage_dir}")
+    est = raw_total = 0
+    if row and os.path.isdir(stage_dir):
+        ok, missing, extra, diff = verify_disk(conn, plan, disk_no, stage_dir, log=False)
+        add("스테이징 = 배정(경로·크기)", ok,
+            "일치" if ok else f"불일치: 누락 {len(missing)}, 추가 {len(extra)}, 크기 다름 {len(diff)}")
+        sp = Specs(conn, plan)
+        total = sum(sz for _r, sz in disk_files(conn, plan, disk_no))
+        try:
+            total += os.path.getsize(os.path.join(stage_dir, "INDEX.txt"))
+        except OSError:
+            pass
+        raw_total = total
+        est = total + sp.ovh(disk_no) * (row[1] + 1)
+        fits = est <= sp.raw_cap(disk_no)
+        add("미디어 용량", fits, f"예상 이미지 {fmt(est)} / 미디어 {fmt(sp.raw_cap(disk_no))}"
+            + ("" if fits else " — 초과"))
+        longest = max((len(os.path.join(stage_dir, r)) for r, _s in disk_files(conn, plan, disk_no)), default=0)
+        add("경로 길이", longest < 240, f"가장 긴 경로 {longest}자" + ("" if longest < 240 else
+            " — 260자 제한에 걸려 이미지 생성이 실패할 수 있습니다."))
+    err = validate_label(label)
+    add("UDF 볼륨 라벨", err is None, f"'{label}'" if err is None else err)
+    out_dir = os.path.dirname(os.path.abspath(iso_path))
+    dest_ok = os.path.isdir(out_dir)
+    add("저장 폴더", dest_ok, out_dir if dest_ok else f"없음: {out_dir}")
+    if dest_ok:
+        exists = os.path.exists(iso_path)
+        add("저장 파일", (not exists) or overwrite,
+            "새 파일" if not exists else ("기존 파일을 덮어씀(--overwrite)" if overwrite else
+                                         f"이미 있음: {iso_path} (덮어쓰려면 --overwrite)"))
+        free = shutil.disk_usage(out_dir).free
+        add("저장 공간", free >= est + 256 * 1024 ** 2, f"여유 {fmt(free)} / 필요 약 {fmt(est)}")
+        if os.path.isdir(stage_dir) and _related(iso_path, stage_dir):
+            add("저장 위치", False, "ISO 를 스테이징 폴더 안에 저장할 수 없습니다.")
+    can_build = False
+    if probe:
+        revs = probe_udf_revisions()
+        if revs is None:
+            add("UDF 2.50 지원(IMAPI)", None, "건너뜀 — Windows PowerShell 에서만 확인·생성할 수 있습니다.")
+        else:
+            can_build = UDF_REV_250 in revs
+            add("UDF 2.50 지원(IMAPI)", can_build,
+                "지원함" if can_build else f"지원 목록에 2.50 이 없습니다: {[hex(r) for r in revs]}")
+    return {"ok": all(c[1] is not False for c in checks), "checks": checks, "label": label,
+            "estimate": est, "raw_total": raw_total, "can_build": can_build, "stage_dir": stage_dir}
+
+
+def _dstring(buf):
+    """UDF dstring 을 문자열로(첫 바이트가 압축 ID: 8=8비트, 16=UTF-16BE, 마지막 바이트가 길이)."""
+    if not buf or buf[-1] == 0:
+        return ""
+    n = buf[-1]
+    body = buf[1:n]
+    try:
+        if buf[0] == 8:
+            return body.decode("latin-1")
+        if buf[0] == 16:
+            return body.decode("utf-16-be")
+    except UnicodeDecodeError:
+        pass
+    return ""
+
+
+def inspect_iso(path):
+    """ISO 파일에서 UDF 라벨·리비전·파일 시스템 종류를 직접 읽는다(2048바이트 섹터).
+    {"size","udf","nsr","iso9660","pvd_label","lvd_label","revision","revision_text","errors"}"""
+    info = {"size": os.path.getsize(path), "udf": False, "nsr": None, "iso9660": False, "pvd_label": None,
+            "lvd_label": None, "revision": None, "revision_text": None, "revisions": {}, "errors": []}
+    with open(path, "rb") as fh:
+        def sector(n):
+            fh.seek(n * ISO_SECTOR)
+            return fh.read(ISO_SECTOR)
+        for n in range(16, 32):                                # 볼륨 인식 구역
+            sec = sector(n)
+            ident = sec[1:6]
+            if ident == b"CD001" and sec[0] == 1:
+                info["iso9660"] = True
+            elif ident in (b"NSR02", b"NSR03"):
+                info["nsr"] = ident.decode()
+            elif ident == b"TEA01":
+                break
+        avdp = sector(256)
+        if len(avdp) < ISO_SECTOR or struct.unpack_from("<H", avdp, 0)[0] != 2:
+            info["errors"].append("섹터 256 에서 앵커 볼륨 기술자(AVDP)를 찾지 못했습니다.")
+            return info
+        length, loc = struct.unpack_from("<II", avdp, 16)
+        for i in range(max(length // ISO_SECTOR, 1)):         # 주 볼륨 기술자 시퀀스
+            d = sector(loc + i)
+            if len(d) < ISO_SECTOR:
+                break
+            tag = struct.unpack_from("<H", d, 0)[0]
+            if tag == 1 and info["pvd_label"] is None:        # 기본 볼륨 기술자
+                info["pvd_label"] = _dstring(d[24:56])
+            elif tag == 6:                                    # 논리 볼륨 기술자
+                info["lvd_label"] = _dstring(d[84:212])
+                if d[217:217 + 19] == b"*OSTA UDF Compliant":
+                    info["udf"] = True
+                    info["revisions"]["도메인"] = struct.unpack_from("<H", d, 240)[0]
+                    ilen, iloc = struct.unpack_from("<II", d, 432)        # 논리 볼륨 무결성 기술자(LVID)
+                    lvid = sector(iloc) if ilen else b""
+                    if len(lvid) == ISO_SECTOR and struct.unpack_from("<H", lvid, 0)[0] == 9:
+                        base = 80 + 8 * struct.unpack_from("<I", lvid, 72)[0]
+                        if base + 46 <= ISO_SECTOR:
+                            rd, wr, mx = struct.unpack_from("<HHH", lvid, base + 40)
+                            info["revisions"].update({"최소읽기": rd, "최소쓰기": wr, "최대쓰기": mx})
+            elif tag == 8:                                    # 종료
+                break
+    if not info["udf"]:
+        info["errors"].append("UDF 논리 볼륨 기술자를 찾지 못했습니다.")
+    else:
+        revs = info["revisions"]
+        info["revision"] = max(revs.values()) if revs else None      # 가장 높은 값을 대표 리비전으로
+        info["revision_text"] = " / ".join(f"{k} {v >> 8}.{v & 0xFF:02x}" for k, v in revs.items())
+    return info
+
+
+def info_label(path):
+    info = inspect_iso(path)
+    return info["lvd_label"] or info["pvd_label"]
+
+
+def check_iso(path, label, revision=UDF_REV_250, min_size=0, max_size=None):
+    """만들어진 ISO 를 요구사항과 대조: UDF 전용, 리비전, 라벨, 크기. [(이름, 통과, 설명)]"""
+    info = inspect_iso(path)
+    out = [("파일 시스템 UDF", info["udf"] and info["nsr"] in ("NSR02", "NSR03"),
+            f"UDF ({info['nsr']})" if info["udf"] else "UDF 가 아닙니다. " + " ".join(info["errors"])),
+           ("ISO9660 없음(UDF 전용)", not info["iso9660"], "UDF 전용" if not info["iso9660"] else "ISO9660 구조도 들어 있습니다."),
+           ("UDF 리비전", revision in info["revisions"].values(),
+            (info["revision_text"] + ("" if revision in info["revisions"].values() else
+             f" — {revision >> 8}.{revision & 0xFF:02x} 인 필드가 없습니다")) if info["revisions"] else "읽을 수 없음")]
+    got = info["lvd_label"] or info["pvd_label"] or ""
+    pvd_ok = (info["pvd_label"] or "") == label[:15 if any(ord(c) > 0xFF for c in label) else 31]
+    out.append(("UDF 라벨", got == label or pvd_ok, f"논리 볼륨 '{info['lvd_label']}', 기본 볼륨 '{info['pvd_label']}'"
+                + ("" if (got == label or pvd_ok) else f" — 기대 '{label}'")))
+    out.append(("이미지 크기", info["size"] >= min_size and (max_size is None or info["size"] <= max_size)
+                and info["size"] % ISO_SECTOR == 0, f"{info['size']:,}바이트 ({info['size'] // ISO_SECTOR:,} 섹터)"))
+    return out, info
+
+
+def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=False, check_only=False,
+             progress=None, confirm=None):
+    """스테이징 폴더 → UDF 2.50 ISO. 순서: ① 사전 검증 → ② (confirm 이 있으면 확인) → ③ 생성 → ④ 생성물 검증.
+    사전 검증이 실패하면 아무것도 쓰지 않는다. check_only 면 ①만 하고 돌아온다.
+    반환 dict: preflight, created(bool), post(생성물 검증 [(이름,통과,설명)]), ok."""
+    pre = iso_preflight(conn, plan, disk_no, stage_root, iso_path, label, overwrite)
+    res = {"preflight": pre, "created": False, "post": [], "ok": False, "iso": iso_path}
+    log_event(conn, plan, disk_no, "ISO 사전 검증" + (": 통과" if pre["ok"] else ": 실패"),
+              "; ".join(f"{t}={'OK' if o else ('건너뜀' if o is None else '실패')}" for t, o, _m in pre["checks"]))
+    if check_only or not pre["ok"]:
+        res["ok"] = pre["ok"] and check_only
+        return res
+    if os.name != "nt" or not _powershell():
+        raise SystemExit("ISO 생성은 Windows(PowerShell + IMAPI2)에서만 가능합니다. 사전 검증은 통과했습니다.")
+    if not pre["can_build"]:
+        raise SystemExit("IMAPI 가 UDF 2.50 을 지원하지 않아 ISO 를 만들지 않았습니다.")
+    if confirm and not confirm(pre):
+        res["cancelled"] = True
+        return res
+    if os.path.exists(iso_path):
+        os.remove(iso_path)                             # overwrite 가 이미 검증을 통과한 경우에만 여기에 옴
+    with tempfile.TemporaryDirectory() as td:
+        script = os.path.join(td, "iso.ps1")
+        with open(script, "w", encoding="utf-8-sig") as fh:
+            fh.write(ISO_SCRIPT)
+        proc = subprocess.Popen([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+                                 "-Src", pre["stage_dir"], "-Dest", iso_path, "-Label", pre["label"],
+                                 "-Revision", str(UDF_REV_250)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace")
+        errors = []
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("PROGRESS:") and progress:
+                w, t = (int(x) for x in line[9:].split(","))
+                progress({"phase": "iso", "file": os.path.basename(iso_path), "files_done": 0, "files_total": 0,
+                          "bytes_done": w, "bytes_total": t, "percent": 100.0 * w / t if t else 0.0})
+            elif line.startswith("ERROR:"):
+                errors.append(line[6:])
+        code = proc.wait()
+    if code != 0:
+        try:
+            os.remove(iso_path)                         # 불완전한 ISO 를 남기지 않는다
+        except OSError:
+            pass
+        log_event(conn, plan, disk_no, "ISO 생성 실패", "; ".join(errors) or f"종료 코드 {code}")
+        raise SystemExit("ISO 생성 실패: " + ("; ".join(errors) or f"종료 코드 {code}"))
+    res["created"] = True
+    sp = Specs(conn, plan)
+    post, _info = check_iso(iso_path, pre["label"], UDF_REV_250, min_size=pre["raw_total"],
+                            max_size=sp.raw_cap(disk_no))
+    res["post"] = post
+    res["ok"] = all(p[1] for p in post)
+    log_event(conn, plan, disk_no, "ISO 생성" + (": 검증 통과" if res["ok"] else ": 생성물 검증 실패"),
+              f"{iso_path} ({os.path.getsize(iso_path):,}B, 라벨 {pre['label']}, UDF 2.50)")
+    return res
 
 
 # ---------------------------------------------------------------- CLI
@@ -1141,6 +1456,16 @@ def main(argv=None):
     p.add_argument("--root", help="원본 폴더를 다른 경로로(다른 PC 에서 불러올 때)")
     p.add_argument("--apply-media-types", action="store_true", help="저장된 100G/50G/25G 용량·오버헤드도 적용")
     p.add_argument("--force", action="store_true", help="원본 폴더가 달라도 기존 스캔·배정을 초기화하고 적용")
+    p = sub.add_parser("make-iso", help="스테이징 폴더 → UDF 2.50 ISO. 사전 검증을 먼저 하고 통과해야 생성(Windows)")
+    p.add_argument("name"); p.add_argument("disk", type=int)
+    p.add_argument("--stage", required=True, help="스테이징 루트(그 아래 diskNN)")
+    p.add_argument("--iso", required=True, help="만들 ISO 파일 경로")
+    p.add_argument("--label", help="UDF 볼륨 라벨(기본: diskNN)")
+    p.add_argument("--overwrite", action="store_true", help="같은 이름의 ISO 가 있으면 덮어씀")
+    p.add_argument("--check-only", action="store_true", help="사전 검증만 하고 만들지 않음")
+    p.add_argument("--yes", action="store_true", help="검증 통과 후 확인 질문 없이 바로 생성")
+    p = sub.add_parser("inspect-iso", help="ISO 의 UDF 라벨·리비전·파일 시스템 종류를 읽어 표시")
+    p.add_argument("file"); p.add_argument("--label"); p.add_argument("--revision", default="2.50")
     p = sub.add_parser("allocate", help="스캔 없이 현재 용량 설정으로 다시 배정")
     p.add_argument("name")
     p = sub.add_parser("export", help="하드링크 스테이징 + INDEX + CSV")
@@ -1186,6 +1511,12 @@ def main(argv=None):
             print(f"{k:6} {t['label']:16} 용량 {t['capacity']:>15,} B ({t['capacity'] / GB:.3f} GB)  "
                   f"파일당 {t['per_file']:,} B  고정 {t['fixed'] / 1000 ** 2:.1f} MB")
         return
+    if a.cmd == "inspect-iso":
+        want = int(a.revision.replace(".", "") , 16) if a.revision else UDF_REV_250
+        checks, info = check_iso(a.file, a.label if a.label is not None else (info_label(a.file) or ""), want)
+        for t, ok, m in checks:
+            print(f"  {'✔' if ok else '✖'} {t}: {m}")
+        sys.exit(0 if all(c[1] for c in checks) else 1)
     if a.cmd == "load-settings":
         plan, notes = apply_settings(conn, read_settings(a.file), a.name, a.root, a.apply_media_types, a.force)
         print(f"계획 '{plan['name']}' 에 설정을 반영했습니다. (원본 {plan['root']})")
@@ -1194,6 +1525,37 @@ def main(argv=None):
         print("※ 배정에 반영하려면 allocate(재배정) 또는 scan 을 실행하세요.")
         return
     plan = get_plan(conn, a.name)
+    if a.cmd == "make-iso":
+        def show(pre):
+            print("[사전 검증]")
+            for t, ok, m in pre["checks"]:
+                print(f"  {'✔' if ok else ('–' if ok is None else '✖')} {t}: {m}")
+        def ask(pre):
+            if a.yes:
+                return True
+            return input("검증을 통과했습니다. ISO 를 만들까요? [y/N] ").strip().lower() in ("y", "yes")
+        last = [0.0]
+
+        def prog(p):
+            if time.time() - last[0] > 0.5:
+                last[0] = time.time()
+                print(f"\rISO 생성 {p['percent']:5.1f}%  {fmt(p['bytes_done'])} / {fmt(p['bytes_total'])}", end="", file=sys.stderr)
+        res = make_iso(conn, plan, a.disk, a.stage, a.iso, a.label, a.overwrite, a.check_only, prog, ask)
+        show(res["preflight"])
+        if not res["preflight"]["ok"]:
+            print("사전 검증에 실패해 ISO 를 만들지 않았습니다.")
+            sys.exit(1)
+        if a.check_only:
+            print("사전 검증 통과(--check-only: 만들지 않음).")
+            return
+        if res.get("cancelled"):
+            print("취소했습니다. ISO 를 만들지 않았습니다.")
+            return
+        print("\n[생성물 검증]")
+        for t, ok, m in res["post"]:
+            print(f"  {'✔' if ok else '✖'} {t}: {m}")
+        print(("완료: " if res["ok"] else "검증 실패: ") + a.iso)
+        sys.exit(0 if res["ok"] else 1)
     if a.cmd == "save-settings":
         extra = {"ui": {"stage": a.stage}} if a.stage else None
         write_settings(a.file, export_settings(conn, plan, extra=extra))

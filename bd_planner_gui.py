@@ -161,6 +161,13 @@ class App(tk.Tk):
         ttk.Label(out, text="※ '복사 후 비교'용. 미디어 크기만큼 여유 공간이 필요하며, 이 위치 아래 _bd_verify 폴더에만 씁니다. "
                             "스테이징·미디어와 겹치면 안 됩니다.",
                   foreground="#555").grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(out, text="ISO 저장 위치").grid(row=4, column=0, padx=6, pady=4)
+        self.iso_var = tk.StringVar()
+        ttk.Entry(out, textvariable=self.iso_var, width=26).grid(row=4, column=1, padx=4)
+        ttk.Button(out, text="찾아보기…", command=self.browse_iso).grid(row=4, column=2, padx=4)
+        ttk.Button(out, text="ISO 만들기 (검증 먼저)…", command=self.run_make_iso).grid(row=4, column=3, padx=8)
+        ttk.Label(out, text="※ 스테이징 → UDF(2.50) ISO. 사전 검증을 통과해야만 만들고, 만든 뒤 라벨·리비전·파일 시스템을 다시 확인합니다. Windows 전용.",
+                  foreground="#555").grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
         self.refresh_media_widgets()
         self.log = tk.Text(right, height=9, wrap="word")
@@ -185,6 +192,11 @@ class App(tk.Tk):
             self.root_var.set(os.path.normpath(d))
             if not self.name_var.get():
                 self.name_var.set(os.path.basename(os.path.normpath(d)) or "plan")
+
+    def browse_iso(self):
+        d = filedialog.askdirectory(title="ISO 저장 위치 선택(원본과 다른 빠른 디스크, 여유 공간 필요)")
+        if d:
+            self.iso_var.set(os.path.normpath(d))
 
     def browse_temp(self):
         d = filedialog.askdirectory(title="임시 복사 위치 선택(여유 공간이 큰 하드디스크)")
@@ -492,7 +504,8 @@ class App(tk.Tk):
     # ------------------------------------------------------------ settings save / load
     def ui_values(self):
         return {"unit": self.unit_var.get(), "capacity_text": self.cap_var.get(), "stage": self.stage_var.get(),
-                "temp": self.temp_var.get(), "delete_temp_when_ok": bool(self.deltmp_var.get())}
+                "temp": self.temp_var.get(), "delete_temp_when_ok": bool(self.deltmp_var.get()),
+                "iso_dir": self.iso_var.get()}
 
     def set_ui_values(self, ui):
         if ui.get("unit") in ("GB(십진)", "GiB(이진)"):
@@ -505,6 +518,8 @@ class App(tk.Tk):
             self.temp_var.set(ui["temp"])
         if ui.get("delete_temp_when_ok") is not None:
             self.deltmp_var.set(bool(ui["delete_temp_when_ok"]))
+        if ui.get("iso_dir") is not None:
+            self.iso_var.set(ui["iso_dir"])
 
     def save_settings(self):
         try:
@@ -557,7 +572,7 @@ class App(tk.Tk):
         self.cap_var.set(ui.get("capacity_text") or (f"{cap / (core.GIB if unit_gib else core.GB):.6g}" if cap else "90"))
         self.ovh_var.set(str(p.get("overhead_per_file", 4096)))
         self.set_ui_values({"stage": ui.get("stage"), "temp": ui.get("temp"),
-                            "delete_temp_when_ok": ui.get("delete_temp_when_ok")})
+                            "delete_temp_when_ok": ui.get("delete_temp_when_ok"), "iso_dir": ui.get("iso_dir")})
         # 계획 생성/갱신(원본이 달라지면 확인)
         try:
             self.ensure_plan()
@@ -615,7 +630,7 @@ class App(tk.Tk):
         if st.get("capacity_text"):
             self.cap_var.set(st["capacity_text"])
         self.set_ui_values({"unit": st.get("unit"), "stage": st.get("stage"), "temp": st.get("temp"),
-                            "delete_temp_when_ok": st.get("delete_temp_when_ok")})
+                            "delete_temp_when_ok": st.get("delete_temp_when_ok"), "iso_dir": st.get("iso_dir")})
         if st.get("root") and st.get("name") and os.path.isdir(st["root"]):
             self.after(300, self.load_folders)
 
@@ -954,6 +969,78 @@ class App(tk.Tk):
                 messagebox.showwarning("불일치", f"disk{n:02d}: {core.summarize_compare(res)}\n"
                                        "임시 복사본은 남겨 두었습니다. 목록은 로그를 보세요.")
         self.run_bg(fn, done, "복사 후 비교 중…")
+
+    def run_make_iso(self):
+        """① 사전 검증(쓰기 없음) → ② 결과를 보고 확인 → ③ 생성 → ④ 생성물 검증."""
+        n = self.one_disk()
+        if n is None:
+            return
+        stage, iso_dir = self.stage_var.get().strip(), self.iso_var.get().strip()
+        if not stage or not iso_dir:
+            messagebox.showinfo("확인", "스테이징 위치와 ISO 저장 위치를 먼저 지정하세요(⑤ 출력).")
+            return
+        f = self.form(f"disk{n:02d} ISO 설정", [("label", "UDF 볼륨 라벨 (UDF 2.50)")], {"label": f"disk{n:02d}"})
+        if not f:
+            return
+        label = f["label"]
+        err = core.validate_label(label)
+        if err:
+            messagebox.showerror("라벨 오류", err)
+            return
+        iso_path = os.path.join(iso_dir, f"disk{n:02d}.iso")
+        overwrite = False
+        if os.path.exists(iso_path):
+            if not messagebox.askyesno("기존 파일", f"이미 있습니다:\n{iso_path}\n\n덮어쓸까요?", default="no"):
+                return
+            overwrite = True
+        plan = self.plan
+
+        def lines(checks):
+            return "\n".join(f"{'✔' if ok else ('–' if ok is None else '✖')} {t}: {m}" for t, ok, m in checks)
+
+        def fn_pre(conn):          # 쓰지 않고 검증만
+            return core.make_iso(conn, core.get_plan(conn, plan["name"]), n, stage, iso_path, label,
+                                 overwrite, check_only=True)
+
+        def done_pre(res):
+            pre = res["preflight"]
+            self.say(f"disk{n:02d} ISO 사전 검증: {'통과' if pre['ok'] else '실패'}")
+            for t, ok, m in pre["checks"]:
+                self.say(f"  {'✔' if ok else ('–' if ok is None else '✖')} {t}: {m}")
+            if not pre["ok"]:
+                messagebox.showwarning("사전 검증 실패", lines(pre["checks"]) + "\n\nISO 를 만들지 않았습니다.")
+                return
+            if not pre["can_build"]:
+                messagebox.showinfo("생성 불가", lines(pre["checks"]) +
+                                    "\n\nIMAPI 로 UDF 2.50 을 확인할 수 없어 만들지 않았습니다(Windows PowerShell 필요).")
+                return
+            if not messagebox.askyesno("사전 검증 통과", lines(pre["checks"]) +
+                                       f"\n\n{iso_path}\n라벨 '{label}', UDF 2.50 으로 ISO 를 만들까요?"):
+                self.say("ISO 생성을 취소했습니다.")
+                return
+            last = [0.0]
+
+            def fn_build(conn):
+                def prog(p):
+                    if time.time() - last[0] > 0.3:
+                        last[0] = time.time()
+                        self.q.put(("prog", None, f"ISO 생성 중… {p['percent']:.1f}% · "
+                                                  f"{core.fmt(p['bytes_done'])} / {core.fmt(p['bytes_total'])}"))
+                        self.q.put(("pct", None, p["percent"]))
+                return core.make_iso(conn, core.get_plan(conn, plan["name"]), n, stage, iso_path, label,
+                                     overwrite, False, prog, None)
+
+            def done_build(r):
+                self.say(f"disk{n:02d} ISO 생성 후 검증: {'통과' if r['ok'] else '실패'} — {iso_path}")
+                for t, ok, m in r["post"]:
+                    self.say(f"  {'✔' if ok else '✖'} {t}: {m}")
+                self.refresh_disks()
+                if r["ok"]:
+                    messagebox.showinfo("ISO 완료", lines(r["post"]) + f"\n\n{iso_path}\n\n다음: ImgBurn Write 모드로 이 ISO 를 굽고 Verify 하세요.")
+                else:
+                    messagebox.showwarning("생성물 검증 실패", lines(r["post"]) + "\n\n이 ISO 로 굽지 마세요.")
+            self.run_bg(fn_build, done_build, "ISO 생성 중…")
+        self.run_bg(fn_pre, done_pre, "ISO 사전 검증 중…")
 
     def show_history(self):
         if not self.plan:
