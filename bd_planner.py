@@ -1017,15 +1017,19 @@ def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_n
 
 
 # ---------------------------------------------------------------- export
-def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None):
+def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None, progress=None):
     """stage_root/diskNN 에 하드링크 구성 + INDEX.txt, 목록 CSV(out_dir) 생성.
-    원본 파일은 변경하지 않는다. 하드링크 불가(다른 드라이브/비NTFS)면 중단한다."""
+    원본 파일은 변경하지 않는다. 하드링크 불가(다른 드라이브/비NTFS)면 중단한다.
+    progress(info): phase='export', file, files_done, files_total, percent."""
     name = f"disk{disk_no:02d}"
     dest = os.path.join(stage_root, name)
     files = disk_files(conn, plan, disk_no)
     made = 0
     if hardlink:
-        for rel, _size in files:
+        for i, (rel, _size) in enumerate(files, 1):
+            if progress:
+                progress({"phase": "export", "file": rel, "files_done": i, "files_total": len(files),
+                          "bytes_done": 0, "bytes_total": 0, "percent": 100.0 * (i - 1) / len(files)})
             src = os.path.join(plan["root"], rel)
             dst = os.path.join(dest, rel)
             os.makedirs(long_path(os.path.dirname(dst)), exist_ok=True)
@@ -1388,6 +1392,79 @@ def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=Fa
 
 
 # ---------------------------------------------------------------- CLI
+def fmt_duration(sec):
+    """초 → 'mm:ss' 또는 'h:mm:ss'. None 이면 '--:--'."""
+    if sec is None:
+        return "--:--"
+    sec = int(max(sec, 0))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class Eta:
+    """진행률(0~100)로 경과 시간과 남은 시간을 추정한다. 최근 구간의 속도와 전체 평균 속도를 섞어 흔들림을 줄인다.
+    update(percent) 로 갱신하고, snapshot() 은 갱신 이후 흐른 시간을 반영해 (경과, 남은) 초를 돌려준다."""
+
+    def __init__(self, clock=time.time, window=45.0):
+        self.clock, self.window = clock, window
+        self.t0 = clock()
+        self.samples, self._eta, self._at = [], None, None
+
+    def update(self, percent):
+        now = self.clock()
+        self.samples.append((now, percent))
+        while len(self.samples) > 2 and now - self.samples[1][0] > self.window:
+            self.samples.pop(0)
+        el = now - self.t0
+        eta = None
+        if percent >= 100:
+            eta = 0.0
+        elif percent >= 0.5 and el >= 3:
+            overall = percent / el
+            t1, p1 = self.samples[0]
+            dt, dp = now - t1, percent - p1
+            recent = dp / dt if dt >= 2 and dp > 0 else None
+            rate = 0.7 * recent + 0.3 * overall if recent else overall
+            eta = (100 - percent) / rate
+        self._eta, self._at = eta, now
+        return self.snapshot()
+
+    def snapshot(self):
+        now = self.clock()
+        rem = None if self._eta is None else max(self._eta - (now - self._at), 0.0)
+        return now - self.t0, rem
+
+
+def cli_progress(label=""):
+    """CLI 용 진행 표시기: 한 줄에 단계·진행률·건수·용량·경과·남은 시간·파일명(0.5초마다 갱신)."""
+    eta, last = Eta(), [0.0]
+
+    def cb(p):
+        if time.time() - last[0] < 0.5:
+            return
+        last[0] = time.time()
+        el, rem = eta.update(p["percent"])
+        files = f"  {p['files_done']:,}/{p['files_total']:,}개" if p.get("files_total") else ""
+        size = f"  {fmt(p['bytes_done'])}" if p.get("bytes_total") else ""
+        line = (f"{p.get('step', label)} {p['percent']:5.1f}%{files}{size}  경과 {fmt_duration(el)}  "
+                f"남은 {fmt_duration(rem)}  {short_name(p.get('file', ''), 40)}")
+        print(f"\r{line:<120}", end="", file=sys.stderr)
+    return cb
+
+
+def scan_progress():
+    """스캔처럼 전체 크기를 모르는 작업용: 건수·용량·경과 시간만 표시."""
+    t0, last = time.time(), [0.0]
+
+    def cb(files, size):
+        if time.time() - last[0] < 0.5:
+            return
+        last[0] = time.time()
+        print(f"\r스캔 {files:,}개  {fmt(size)}  경과 {fmt_duration(time.time() - t0)}", end="", file=sys.stderr)
+    return cb
+
+
 def short_name(name, width=60):
     """긴 경로를 가운데를 줄여 표시."""
     if len(name) <= width:
@@ -1534,12 +1611,7 @@ def main(argv=None):
             if a.yes:
                 return True
             return input("검증을 통과했습니다. ISO 를 만들까요? [y/N] ").strip().lower() in ("y", "yes")
-        last = [0.0]
-
-        def prog(p):
-            if time.time() - last[0] > 0.5:
-                last[0] = time.time()
-                print(f"\rISO 생성 {p['percent']:5.1f}%  {fmt(p['bytes_done'])} / {fmt(p['bytes_total'])}", end="", file=sys.stderr)
+        prog = cli_progress("ISO 생성")
         res = make_iso(conn, plan, a.disk, a.stage, a.iso, a.label, a.overwrite, a.check_only, prog, ask)
         show(res["preflight"])
         if not res["preflight"]["ok"]:
@@ -1602,7 +1674,7 @@ def main(argv=None):
             print("추가할 새 폴더가 없습니다.")
             return
         nf, n, b = add_folders(conn, plan, folders,
-                               lambda f, s: print(f"\r스캔 {f:,}개 {fmt(s)}", end="", file=sys.stderr))
+                               scan_progress())
         placed, touched = allocate_new(conn, plan)
         print(f"\n새 폴더 {nf}개, 파일 {n:,}개, {fmt(b)} → {placed:,}개 배정")
         print("내용이 바뀐 디스크: " + (", ".join(f"disk{t:02d}" for t in touched) or "없음"))
@@ -1614,7 +1686,7 @@ def main(argv=None):
         if locked_disks(conn, plan) and not a.force:
             raise SystemExit("이미 구운(또는 굽는 중) 디스크가 있어 전체 재스캔은 상태·배정을 모두 초기화합니다.\n"
                              "새 폴더만 추가하려면 'add' 를 쓰세요. 정말 초기화하려면 --force.")
-        n, b = scan(conn, plan, lambda f, s: print(f"\r스캔 {f:,}개 {fmt(s)}", end="", file=sys.stderr))
+        n, b = scan(conn, plan, scan_progress())
         print(f"\n파일 {n:,}개, {fmt(b)}")
         dec, bi = estimate_disks(b, plan["capacity"])
         print(f"예상 디스크 수: 십진 {dec}장 / 이진 {bi}장")
@@ -1651,7 +1723,8 @@ def main(argv=None):
         nos = a.disks or [r[0] for r in conn.execute(
             "SELECT disk_no FROM disk WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],))]
         for n in nos:
-            dest, csvp, made = export_disk(conn, plan, n, a.stage, not a.no_hardlink)
+            dest, csvp, made = export_disk(conn, plan, n, a.stage, not a.no_hardlink,
+                                           progress=cli_progress(f"disk{n:02d} 내보내기"))
             print(f"disk{n:02d}: {dest} (링크 {made}개), {csvp}")
     elif a.cmd == "status":
         set_status(conn, plan, a.disk, a.status); print("변경됨")
@@ -1667,14 +1740,7 @@ def main(argv=None):
             print(f"{at}  {'계획' if dn == 0 else f'disk{dn:02d}'}  {ev}" + (f"  — {detail}" if detail else ""))
     elif a.cmd == "compare":
         stage_dir = os.path.join(a.stage, f"disk{a.disk:02d}")
-        last = [0.0]
-
-        def prog(p):
-            if time.time() - last[0] > 0.5:
-                last[0] = time.time()
-                line = (f"{p.get('step', '비교')} {p['percent']:5.1f}%  {p['files_done']:,}/{p['files_total']:,}개  "
-                        f"{fmt(p['bytes_done'])}  {short_name(p['file'])}")
-                print(f"\r{line:<110}", end="", file=sys.stderr)
+        prog = cli_progress("비교")
         if a.via_copy:
             res = verify_via_copy(conn, plan, a.disk, stage_dir, a.media, a.via_copy, a.copy,
                                   not a.keep_copy, prog)

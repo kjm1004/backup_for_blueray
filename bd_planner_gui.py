@@ -31,7 +31,10 @@ class App(tk.Tk):
         self._build()
         self.restore_state()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.job = None            # 실행 중인 백그라운드 작업의 진행 상태(아래 '작업 진행 표시' 참고)
+        self._bar_ind = False
         self.after(100, self._poll)
+        self.after(1000, self._tick)
 
     # ------------------------------------------------------------ UI
     def _build(self):
@@ -333,7 +336,7 @@ class App(tk.Tk):
             messagebox.showinfo("작업 중", "진행 중인 작업이 끝난 뒤에 다시 시도하세요.")
             return
         self.busy = True
-        self.status.set(label)
+        self._job_start(label)
 
         def work():
             conn = core.connect(DB_PATH)
@@ -353,16 +356,19 @@ class App(tk.Tk):
             while True:
                 kind, done, res = self.q.get_nowait()
                 if kind == "prog":
-                    self.status.set(res)
+                    if self.job:
+                        self.job["text"] = res
+                        self._refresh_status()
                     continue
                 if kind == "pct":
-                    self.pbar["value"] = res
-                    self.pct_var.set(f"{res:.1f}%")
+                    if self.job:
+                        self.job["pct"] = res
+                        self.job["eta"].update(res)
+                        self._set_bar(res)
+                        self._refresh_status()
                     continue
                 self.busy = False
-                self.status.set("준비")
-                self.pbar["value"] = 0
-                self.pct_var.set("")
+                self._job_end(failed=(kind == "err"))
                 if kind == "err":
                     self.say(f"[오류] {res}")
                     messagebox.showerror("오류", str(res))
@@ -371,6 +377,57 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+    # ------------------------------------------------------------ 작업 진행 표시 (공통)
+    # run_bg 로 실행하는 모든 작업이 자동으로 받는다: 하단에 '경과 시간', 총량을 아는 작업은 진행 막대·퍼센트·'남은 시간'.
+    #  - 상태 문구 갱신:  self.q.put(("prog", None, "문구"))
+    #  - 진행률(0~100):   self.q.put(("pct", None, 퍼센트))   ← 보내면 진행 막대와 남은 시간이 켜진다
+    #  - 진행률을 모르는 작업(스캔 등)은 문구만 보내면 '경과 시간'만 표시되고 막대는 움직이는 표시로 바뀐다.
+    # 새 기능을 추가할 때도 run_bg 로 실행하고 위 두 메시지(또는 post_progress)만 보내면 동일하게 표시된다.
+    def _job_start(self, label):
+        self.job = {"label": label, "text": label, "pct": None, "eta": core.Eta()}
+        self._set_bar(None)
+        self._refresh_status()
+
+    def _job_end(self, failed=False):
+        j, self.job = self.job, None
+        self._set_bar(0, idle=True)
+        self.status.set("준비")
+        if j:
+            el, _ = j["eta"].snapshot()
+            if el >= 3:
+                self.say(f"⏱ {j['label']}: {'중단됨, ' if failed else ''}총 {core.fmt_duration(el)} 소요")
+
+    def _set_bar(self, pct, idle=False):
+        if pct is None:                                   # 진행률을 아직 모름 → 움직이는 막대
+            if not self._bar_ind:
+                self.pbar.configure(mode="indeterminate")
+                self.pbar.start(60)
+                self._bar_ind = True
+            self.pct_var.set("")
+            return
+        if self._bar_ind:
+            self.pbar.stop()
+            self.pbar.configure(mode="determinate")
+            self._bar_ind = False
+        self.pbar["value"] = pct
+        self.pct_var.set("" if idle else f"{pct:.1f}%")
+
+    def _refresh_status(self):
+        j = self.job
+        if not j:
+            return
+        el, rem = j["eta"].snapshot()
+        parts = [j["text"], f"경과 {core.fmt_duration(el)}"]
+        if j["pct"] is not None:
+            parts.append("남은 약 " + (core.fmt_duration(rem) if rem is not None else "계산 중…"))
+        self.status.set("  ·  ".join(parts))
+
+    def _tick(self):
+        """1초마다 경과·남은 시간을 갱신(진행 메시지가 뜸해도 시간은 계속 흐른다)."""
+        if self.job:
+            self._refresh_status()
+        self.after(1000, self._tick)
 
     # ------------------------------------------------------------ scan / allocate
     def run_scan(self):
@@ -1021,6 +1078,8 @@ class App(tk.Tk):
             last = [0.0]
 
             def fn_build(conn):
+                self.q.put(("prog", None, "ISO 준비 중(검증·파일 목록 구성)…"))
+
                 def prog(p):
                     if time.time() - last[0] > 0.3:
                         last[0] = time.time()
@@ -1088,10 +1147,20 @@ class App(tk.Tk):
 
         def fn(conn):
             p = core.get_plan(conn, plan["name"])
-            out = []
+            counts = dict(conn.execute("SELECT disk_no, file_count FROM disk WHERE plan_id=?", (p["plan_id"],)))
+            total = sum(counts.get(n, 0) for n in nos) or 1      # 선택한 모든 디스크를 합친 파일 수
+            base, last, out = [0], [0.0], []
             for n in nos:
-                self.q.put(("prog", None, f"disk{n:02d} 하드링크 생성 중…"))
-                out.append(core.export_disk(conn, p, n, stage))
+                def prog(info, n=n):
+                    if time.time() - last[0] < 0.3:
+                        return
+                    last[0] = time.time()
+                    done_n = base[0] + info["files_done"]
+                    self.q.put(("prog", None, f"disk{n:02d} 하드링크 생성 · {done_n:,}/{total:,}개 · "
+                                              f"{core.short_name(info['file'], 50)}"))
+                    self.q.put(("pct", None, 100.0 * (done_n - 1) / total))
+                out.append(core.export_disk(conn, p, n, stage, progress=prog))
+                base[0] += counts.get(n, 0)
             return out
 
         def done(res):
