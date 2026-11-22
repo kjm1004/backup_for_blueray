@@ -32,6 +32,8 @@ class App(tk.Tk):
         self.restore_state()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.job = None            # 실행 중인 백그라운드 작업의 진행 상태(아래 '작업 진행 표시' 참고)
+        self.cancel = core.CancelToken()
+        self._closing = False
         self._bar_ind = False
         self.after(100, self._poll)
         self.after(1000, self._tick)
@@ -178,6 +180,8 @@ class App(tk.Tk):
         self.status = tk.StringVar(value="준비")
         bar = ttk.Frame(self)
         bar.pack(fill="x", side="bottom")
+        self.cancel_btn = ttk.Button(bar, text="■ 중지", width=8, state="disabled", command=self.request_cancel)
+        self.cancel_btn.pack(side="right", padx=(0, 6), pady=1)
         self.pct_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.pct_var, width=7, anchor="e").pack(side="right", padx=(0, 6))
         self.pbar = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate", maximum=100)
@@ -336,6 +340,8 @@ class App(tk.Tk):
             messagebox.showinfo("작업 중", "진행 중인 작업이 끝난 뒤에 다시 시도하세요.")
             return
         self.busy = True
+        self.cancel = core.CancelToken()          # 이 작업의 중지 신호(작업 함수는 cancel=self.cancel 로 받는다)
+        self.cancel_btn.configure(state="normal")
         self._job_start(label)
 
         def work():
@@ -343,6 +349,8 @@ class App(tk.Tk):
             try:
                 res = fn(conn)
                 self.q.put(("ok", done, res))
+            except core.Cancelled as e:
+                self.q.put(("cancelled", done, str(e)))
             except SystemExit as e:
                 self.q.put(("err", done, str(e)))
             except Exception as e:  # noqa: BLE001
@@ -368,10 +376,12 @@ class App(tk.Tk):
                         self._refresh_status()
                     continue
                 self.busy = False
-                self._job_end(failed=(kind == "err"))
+                self._job_end(failed=(kind == "err"), cancelled=(kind == "cancelled"))
                 if kind == "err":
                     self.say(f"[오류] {res}")
                     messagebox.showerror("오류", str(res))
+                elif kind == "cancelled":
+                    self.say("■ 작업을 중지했습니다. 진행하던 작업은 정리했습니다(스캔은 이전 결과 유지, ISO·임시 복사본은 삭제).")
                 else:
                     done(res)
         except queue.Empty:
@@ -389,14 +399,16 @@ class App(tk.Tk):
         self._set_bar(None)
         self._refresh_status()
 
-    def _job_end(self, failed=False):
+    def _job_end(self, failed=False, cancelled=False):
         j, self.job = self.job, None
         self._set_bar(0, idle=True)
+        self.cancel_btn.configure(state="disabled")
         self.status.set("준비")
         if j:
             el, _ = j["eta"].snapshot()
             if el >= 3:
-                self.say(f"⏱ {j['label']}: {'중단됨, ' if failed else ''}총 {core.fmt_duration(el)} 소요")
+                tag = "중지됨, " if cancelled else ("오류로 중단, " if failed else "")
+                self.say(f"⏱ {j['label']}: {tag}총 {core.fmt_duration(el)} 소요")
 
     def _set_bar(self, pct, idle=False):
         if pct is None:                                   # 진행률을 아직 모름 → 움직이는 막대
@@ -422,6 +434,23 @@ class App(tk.Tk):
         if j["pct"] is not None:
             parts.append("남은 약 " + (core.fmt_duration(rem) if rem is not None else "계산 중…"))
         self.status.set("  ·  ".join(parts))
+
+    def request_cancel(self):
+        """[■ 중지]: 확인 후 중지 신호를 보낸다. 작업은 다음 파일·조각 경계에서 멈추고 스스로 뒤처리한다."""
+        if not self.job or self.cancel.cancelled:
+            return
+        if not messagebox.askyesno(
+                "작업 중지", f"'{self.job['label']}' 을(를) 중지할까요?\n\n"
+                "· 스캔: 이전 스캔·배정 결과가 그대로 유지됩니다.\n"
+                "· 복사 후 비교: 임시 복사본을 삭제합니다.\n"
+                "· ISO 생성: 불완전한 ISO 를 삭제합니다.\n"
+                "· 내보내기: 만든 하드링크는 남고, 다시 실행하면 이어서 진행합니다.\n"
+                "· 비교: 결과와 상태는 바뀌지 않습니다.", default="no"):
+            return
+        self.cancel.cancel()
+        self.cancel_btn.configure(state="disabled")
+        self.job["text"] = "중지하는 중… (정리 중)"
+        self._refresh_status()
 
     def _tick(self):
         """1초마다 경과·남은 시간을 갱신(진행 메시지가 뜸해도 시간은 계속 흐른다)."""
@@ -458,7 +487,8 @@ class App(tk.Tk):
 
         def fn(conn):
             p = core.get_plan(conn, plan["name"])
-            n, b = core.scan(conn, p, lambda f, s: self.q.put(("prog", None, f"스캔 중… {f:,}개 / {core.fmt(s)}")))
+            n, b = core.scan(conn, p, lambda f, s: self.q.put(("prog", None, f"스캔 중… {f:,}개 / {core.fmt(s)}")),
+                             self.cancel)
             disks = core.allocate(conn, p)
             return n, b, len(disks)
 
@@ -506,7 +536,8 @@ class App(tk.Tk):
         def fn(conn):
             p = core.get_plan(conn, plan["name"])
             nf, n, b = core.add_folders(conn, p, new,
-                                        lambda f, s: self.q.put(("prog", None, f"새 폴더 스캔 중… {f:,}개 / {core.fmt(s)}")))
+                                        lambda f, s: self.q.put(("prog", None, f"새 폴더 스캔 중… {f:,}개 / {core.fmt(s)}")),
+                                        self.cancel)
             placed, touched = core.allocate_new(conn, p)
             return nf, n, b, placed, touched
 
@@ -692,6 +723,24 @@ class App(tk.Tk):
             self.after(300, self.load_folders)
 
     def on_close(self):
+        if self.busy:
+            if not messagebox.askyesno("작업 중", "작업이 진행 중입니다. 중지하고 정리한 뒤 종료할까요?", default="no"):
+                return
+            self.cancel.cancel()
+            self.status.set("중지하는 중… (정리 후 종료)")
+            self._closing = True
+            self._wait_close(0)
+            return
+        self._save_and_destroy()
+
+    def _wait_close(self, tries):
+        """중지 정리가 끝날 때까지(최대 약 15초) 기다렸다가 종료한다."""
+        if self.busy and tries < 50:
+            self.after(300, lambda: self._wait_close(tries + 1))
+            return
+        self._save_and_destroy()
+
+    def _save_and_destroy(self):
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as fh:
                 json.dump({"root": self.root_var.get(), "name": self.name_var.get(),
@@ -951,7 +1000,8 @@ class App(tk.Tk):
         def fn(conn):
             def prog(p):
                 self.post_progress("미디어 비교 중", p, last)
-            return core.verify_media(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, full, None, prog)
+            return core.verify_media(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, full, None, prog,
+                                     self.cancel)
 
         def done(res):
             self.say(f"disk{n:02d} 미디어 비교 {'전체' if full else '빠른'}: {res['verdict']} — "
@@ -1005,7 +1055,7 @@ class App(tk.Tk):
             def prog(p):
                 self.post_progress("복사 후 비교 중", p, last)
             return core.verify_via_copy(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, temp,
-                                        None, delete_ok, prog)
+                                        None, delete_ok, prog, self.cancel)
 
         def done(res):
             self.say(f"disk{n:02d} 복사 후 비교: {res['verdict']} — {core.summarize_compare(res)} "
@@ -1087,7 +1137,7 @@ class App(tk.Tk):
                                                   f"{core.fmt(p['bytes_done'])} / {core.fmt(p['bytes_total'])}"))
                         self.q.put(("pct", None, p["percent"]))
                 return core.make_iso(conn, core.get_plan(conn, plan["name"]), n, stage, iso_path, label,
-                                     overwrite, False, prog, None)
+                                     overwrite, False, prog, None, self.cancel)
 
             def done_build(r):
                 self.say(f"disk{n:02d} ISO 생성 후 검증: {'통과' if r['ok'] else '실패'} — {iso_path}")
@@ -1159,7 +1209,7 @@ class App(tk.Tk):
                     self.q.put(("prog", None, f"disk{n:02d} 하드링크 생성 · {done_n:,}/{total:,}개 · "
                                               f"{core.short_name(info['file'], 50)}"))
                     self.q.put(("pct", None, 100.0 * (done_n - 1) / total))
-                out.append(core.export_disk(conn, p, n, stage, progress=prog))
+                out.append(core.export_disk(conn, p, n, stage, progress=prog, cancel=self.cancel))
                 base[0] += counts.get(n, 0)
             return out
 

@@ -11,11 +11,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 GB = 1000 ** 3
@@ -66,6 +68,28 @@ DEFAULT_MEDIA = [
     ("BD50", "BD-R DL 50GB", 50_050_629_632, 4096, 64 * 1024 * 1024),
     ("BD25", "BD-R 25GB", 25_025_314_816, 4096, 64 * 1024 * 1024),
 ]
+
+
+class Cancelled(Exception):
+    """사용자가 작업을 중지했다(오류가 아님)."""
+
+
+class CancelToken:
+    """오래 걸리는 작업에 넘기는 중지 신호. 작업은 파일·조각마다 check() 를 불러 중지 요청을 확인하고 정리한다."""
+
+    def __init__(self):
+        self._ev = threading.Event()
+
+    def cancel(self):
+        self._ev.set()
+
+    @property
+    def cancelled(self):
+        return self._ev.is_set()
+
+    def check(self):
+        if self._ev.is_set():
+            raise Cancelled("사용자가 중지했습니다.")
 
 
 def connect(db_path):
@@ -412,9 +436,10 @@ def set_folders(conn, plan, folders):
 
 
 # ---------------------------------------------------------------- scan
-def scan(conn, plan, progress=None):
+def scan(conn, plan, progress=None, cancel=None):
     """전체 재스캔: 기존 파일 목록·배정·디스크(상태 포함)를 모두 지우고 처음부터 다시 만든다.
-    이미 구운 디스크가 있으면 add_folders()/allocate_new() 를 쓸 것."""
+    이미 구운 디스크가 있으면 add_folders()/allocate_new() 를 쓸 것.
+    cancel 로 중지하면 하나의 트랜잭션이라 이전 결과로 되돌린다."""
     pid = plan["plan_id"]
     conn.execute("DELETE FROM file_info WHERE plan_id=?", (pid,))
     conn.execute("DELETE FROM assignment WHERE plan_id=?", (pid,))
@@ -422,13 +447,18 @@ def scan(conn, plan, progress=None):
     conn.execute("DELETE FROM warning WHERE plan_id=?", (pid,))
     folders = conn.execute("SELECT seq, folder_path FROM selected_folder WHERE plan_id=? ORDER BY seq",
                            (pid,)).fetchall()
-    total = _scan_folders(conn, plan, folders, progress)
+    try:
+        total = _scan_folders(conn, plan, folders, progress, cancel, commit=False)
+    except Cancelled:
+        conn.rollback()                                  # 지운 것도, 읽은 것도 모두 취소
+        log_event(conn, plan, 0, "전체 재스캔 중지", "이전 스캔·배정 결과를 그대로 유지")
+        raise
     _size_warnings(conn, plan)
     log_event(conn, plan, 0, "전체 재스캔", f"파일 {total[0]:,}개 — 배정·디스크 상태 초기화")
     return total
 
 
-def _scan_folders(conn, plan, folders, progress=None):
+def _scan_folders(conn, plan, folders, progress=None, cancel=None, commit=True):
     """folders: [(seq, 폴더명)] 을 읽어 file_info 에 추가. (파일수, 바이트) 반환."""
     pid, root = plan["plan_id"], plan["root"]
     total_files = total_bytes = 0
@@ -436,6 +466,8 @@ def _scan_folders(conn, plan, folders, progress=None):
         stack = [os.path.join(root, folder)]
         batch = []
         while stack:
+            if cancel:
+                cancel.check()
             d = stack.pop()
             try:
                 entries = list(os.scandir(long_path(d)))
@@ -458,7 +490,8 @@ def _scan_folders(conn, plan, folders, progress=None):
                 progress(total_files, total_bytes)
         conn.executemany("INSERT INTO file_info(plan_id, folder_seq, rel_path, size_bytes, mtime) "
                          "VALUES(?,?,?,?,?)", batch)
-        conn.commit()
+        if commit:
+            conn.commit()
     return total_files, total_bytes
 
 
@@ -484,7 +517,7 @@ def new_subfolders(conn, plan):
     return [f for f in list_subfolders(plan["root"]) if f not in have]
 
 
-def add_folders(conn, plan, folders, progress=None):
+def add_folders(conn, plan, folders, progress=None, cancel=None):
     """새 하위 폴더만 선택 목록 '끝'에 추가하고 그 폴더만 스캔한다.
     기존 파일 목록·배정·디스크 상태는 건드리지 않는다. (추가된 폴더 수, 파일 수, 바이트) 반환."""
     pid = plan["plan_id"]
@@ -497,8 +530,11 @@ def add_folders(conn, plan, folders, progress=None):
     min_fid = conn.execute("SELECT COALESCE(MAX(file_id),0) FROM file_info").fetchone()[0]
     new = [(seq0 + i + 1, f) for i, f in enumerate(todo)]
     conn.executemany("INSERT INTO selected_folder VALUES(?,?,?)", [(pid, q, f) for q, f in new])
-    conn.commit()
-    n, b = _scan_folders(conn, plan, new, progress)
+    try:                                               # 폴더 추가와 스캔을 한 트랜잭션으로: 중지하면 추가도 취소
+        n, b = _scan_folders(conn, plan, new, progress, cancel, commit=False)
+    except Cancelled:
+        conn.rollback()
+        raise
     _size_warnings(conn, plan, min_fid)
     return len(todo), n, b
 
@@ -789,7 +825,7 @@ def _same_content(a, b, on_bytes=None):
                 return True
 
 
-def compare_dirs(src, dst, full=True, progress=None):
+def compare_dirs(src, dst, full=True, progress=None, cancel=None):
     """스테이징 폴더(src)와 미디어(dst)를 대조한다.
     full=True 면 모든 파일을 바이트 단위로 비교, False 면 존재·크기만(빠른 검사).
     숨김/시스템 파일이 미디어에 없는 것은 실패로 치지 않고 따로 보고한다(ImgBurn 이 기본 제외).
@@ -814,6 +850,8 @@ def compare_dirs(src, dst, full=True, progress=None):
                       "bytes_done": done_b[0], "bytes_total": total_b, "percent": min(pct, 100.0)})
 
     for key in sorted(a, key=lambda k: natural_key(a[k][0])):
+        if cancel:
+            cancel.check()
         rel, sp = a[key]
         done_f += 1
         report(rel)
@@ -828,6 +866,8 @@ def compare_dirs(src, dst, full=True, progress=None):
                 continue
             if full:
                 def tick(n, rel=rel):
+                    if cancel:
+                        cancel.check()
                     done_b[0] += n
                     report(rel)
                 if not _same_content(sp, dp, tick):
@@ -856,14 +896,18 @@ def summarize_compare(res):
     return ", ".join(parts)
 
 
-def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=None, progress=None):
+def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=None, progress=None, cancel=None):
     """스테이징(원본)↔미디어 직접 비교 후 이력에 기록. 전체(바이트) 비교가 모두 일치하면 상태를 '검증됨'으로.
     copy_no 가 없으면 가장 최근 사본 기록에 결과를 붙이고, 사본 기록이 없으면 새로 만든다."""
     if not os.path.isdir(stage_dir):
         raise SystemExit(f"스테이징 폴더가 없습니다: {stage_dir}")
     if not os.path.isdir(media_dir):
         raise SystemExit(f"미디어 경로에 접근할 수 없습니다: {media_dir}")
-    res = compare_dirs(stage_dir, media_dir, full, progress)
+    try:
+        res = compare_dirs(stage_dir, media_dir, full, progress, cancel)
+    except Cancelled:                                   # 결과·상태는 바꾸지 않고 이력만 남긴다
+        log_event(conn, plan, disk_no, "미디어 비교 중지", f"사용자가 중지함 | 미디어 {media_dir}")
+        raise
     return _finish_verification(conn, plan, disk_no, res, full, f"미디어 {media_dir}", copy_no, "미디어 비교")
 
 
@@ -913,7 +957,7 @@ def _related(a, b):
         return False
 
 
-def copy_media(src, dst, progress=None):
+def copy_media(src, dst, progress=None, cancel=None):
     """미디어(src)의 모든 파일을 dst 로 복사한다. 읽기 실패는 파일별로 모아 두고 계속 진행한다(중단하지 않음).
     progress(info): phase='copy', file, files_done, files_total, bytes_done, bytes_total, percent.
     복사 실패 [(rel, 오류)], 복사한 바이트를 반환."""
@@ -947,6 +991,8 @@ def copy_media(src, dst, progress=None):
         try:
             with open(full, "rb") as fi, open(out, "wb") as fo:
                 while True:
+                    if cancel:
+                        cancel.check()
                     chunk = fi.read(CHUNK)
                     if not chunk:
                         break
@@ -957,6 +1003,12 @@ def copy_media(src, dst, progress=None):
                 shutil.copystat(full, out)
             except OSError:
                 pass
+        except Cancelled:
+            try:
+                os.remove(out)                        # 쓰다 만 파일을 남기지 않는다
+            except OSError:
+                pass
+            raise
         except OSError as e:
             if getattr(e, "errno", None) == 28:       # ENOSPC
                 raise SystemExit("임시 위치의 공간이 부족해 복사를 중단했습니다.")
@@ -970,7 +1022,7 @@ def copy_media(src, dst, progress=None):
 
 
 def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_no=None,
-                    delete_when_ok=True, progress=None):
+                    delete_when_ok=True, progress=None, cancel=None):
     """① 미디어의 파일을 temp_root 아래 임시 폴더로 복사 → ② 복사본을 스테이징과 전체(바이트) 비교 → 이력 기록.
     임시 폴더는 temp_root/_bd_verify/<계획>_diskNN 이며, 이 프로그램이 만든 표식 파일이 있는 폴더만 지운다.
     복사 중 읽기 실패한 파일이 있으면 불일치로 판정하고 복사본은 남겨 둔다.
@@ -997,9 +1049,14 @@ def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_n
                 info = dict(info, step=step, phase_percent=info["percent"], percent=base + info["percent"] / 2)
                 progress(info)
         return cb
-    copy_errors, copied = copy_media(media_dir, target, stage("1/2 복사", 0.0))
-    copy_secs = time.time() - t0
-    res = compare_dirs(stage_dir, target, True, stage("2/2 비교", 50.0))
+    try:
+        copy_errors, copied = copy_media(media_dir, target, stage("1/2 복사", 0.0), cancel)
+        copy_secs = time.time() - t0
+        res = compare_dirs(stage_dir, target, True, stage("2/2 비교", 50.0), cancel)
+    except Cancelled:                                   # 임시 복사본(표식이 있는 우리 폴더)을 정리하고 이력만 남긴다
+        shutil.rmtree(long_path(target), ignore_errors=True)
+        log_event(conn, plan, disk_no, "미디어 비교(복사 경유) 중지", f"사용자가 중지함, 임시 복사본 삭제 | 미디어 {media_dir}")
+        raise
     res["extra"] = [r for r in res["extra"] if r.lower() != TMP_MARKER]      # 표식 파일은 비교 대상이 아님
     res["copy_errors"] = copy_errors
     res["ok"] = not (res["missing"] or res["extra"] or res["size_diff"] or res["content_diff"]
@@ -1017,7 +1074,7 @@ def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_n
 
 
 # ---------------------------------------------------------------- export
-def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None, progress=None):
+def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None, progress=None, cancel=None):
     """stage_root/diskNN 에 하드링크 구성 + INDEX.txt, 목록 CSV(out_dir) 생성.
     원본 파일은 변경하지 않는다. 하드링크 불가(다른 드라이브/비NTFS)면 중단한다.
     progress(info): phase='export', file, files_done, files_total, percent."""
@@ -1027,6 +1084,9 @@ def export_disk(conn, plan, disk_no, stage_root, hardlink=True, out_dir=None, pr
     made = 0
     if hardlink:
         for i, (rel, _size) in enumerate(files, 1):
+            if cancel and cancel.cancelled:               # 만들어 둔 하드링크는 다음 내보내기에서 이어서 쓴다
+                log_event(conn, plan, disk_no, "스테이징 내보내기 중지", f"{made:,}개 만든 상태에서 중지 — 다시 실행하면 이어서 진행")
+                cancel.check()
             if progress:
                 progress({"phase": "export", "file": rel, "files_done": i, "files_total": len(files),
                           "bytes_done": 0, "bytes_total": 0, "percent": 100.0 * (i - 1) / len(files)})
@@ -1335,7 +1395,7 @@ def check_iso(path, label, revision=UDF_REV_250, min_size=0, max_size=None):
 
 
 def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=False, check_only=False,
-             progress=None, confirm=None):
+             progress=None, confirm=None, cancel=None):
     """스테이징 폴더 → UDF 2.50 ISO. 순서: ① 사전 검증 → ② (confirm 이 있으면 확인) → ③ 생성 → ④ 생성물 검증.
     사전 검증이 실패하면 아무것도 쓰지 않는다. check_only 면 ①만 하고 돌아온다.
     반환 dict: preflight, created(bool), post(생성물 검증 [(이름,통과,설명)]), ok."""
@@ -1353,6 +1413,8 @@ def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=Fa
     if confirm and not confirm(pre):
         res["cancelled"] = True
         return res
+    if cancel:
+        cancel.check()
     if os.path.exists(iso_path):
         os.remove(iso_path)                             # overwrite 가 이미 검증을 통과한 경우에만 여기에 옴
     with tempfile.TemporaryDirectory() as td:
@@ -1363,6 +1425,14 @@ def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=Fa
                                  "-Src", pre["stage_dir"], "-Dest", iso_path, "-Label", pre["label"],
                                  "-Revision", str(UDF_REV_250)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace")
+        if cancel:                                       # 중지 요청이 오면 PowerShell 을 바로 종료한다
+            def watch():
+                while proc.poll() is None:
+                    if cancel.cancelled:
+                        proc.kill()
+                        return
+                    time.sleep(0.3)
+            threading.Thread(target=watch, daemon=True).start()
         errors = []
         for line in proc.stdout:
             line = line.strip()
@@ -1373,6 +1443,13 @@ def make_iso(conn, plan, disk_no, stage_root, iso_path, label=None, overwrite=Fa
             elif line.startswith("ERROR:"):
                 errors.append(line[6:])
         code = proc.wait()
+    if cancel and cancel.cancelled:
+        try:
+            os.remove(iso_path)                         # 불완전한 ISO 는 지운다
+        except OSError:
+            pass
+        log_event(conn, plan, disk_no, "ISO 생성 중지", f"사용자가 중지함, 불완전한 ISO 삭제 | {iso_path}")
+        raise Cancelled("사용자가 중지했습니다.")
     if code != 0:
         try:
             os.remove(iso_path)                         # 불완전한 ISO 를 남기지 않는다
@@ -1570,6 +1647,26 @@ def main(argv=None):
     p = sub.add_parser("verify", help="경로·크기를 DB 와 대조(내용 비교 아님)")
     p.add_argument("name"); p.add_argument("disk", type=int); p.add_argument("path")
     a = ap.parse_args(argv)
+    tok = CancelToken()
+    hits = [0]
+
+    def on_sigint(_sig, _frame):
+        """첫 Ctrl+C: 안전하게 중지(뒤처리 후 종료). 두 번째: 강제 종료."""
+        hits[0] += 1
+        if hits[0] == 1:
+            tok.cancel()
+            print("\n중지하는 중… (정리 후 종료됩니다. 한 번 더 누르면 강제 종료)", file=sys.stderr)
+        else:
+            raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, on_sigint)
+    try:
+        _dispatch(a, tok)
+    except Cancelled:
+        print("\n사용자가 작업을 중지했습니다.", file=sys.stderr)
+        sys.exit(130)
+
+
+def _dispatch(a, tok):
 
     conn = connect(a.db)
     if a.cmd == "new":
@@ -1610,9 +1707,15 @@ def main(argv=None):
         def ask(pre):
             if a.yes:
                 return True
-            return input("검증을 통과했습니다. ISO 를 만들까요? [y/N] ").strip().lower() in ("y", "yes")
+            old = signal.signal(signal.SIGINT, signal.default_int_handler)   # 입력 대기 중에는 Ctrl+C 로 바로 취소
+            try:
+                return input("검증을 통과했습니다. ISO 를 만들까요? [y/N] ").strip().lower() in ("y", "yes")
+            except KeyboardInterrupt:
+                return False
+            finally:
+                signal.signal(signal.SIGINT, old)
         prog = cli_progress("ISO 생성")
-        res = make_iso(conn, plan, a.disk, a.stage, a.iso, a.label, a.overwrite, a.check_only, prog, ask)
+        res = make_iso(conn, plan, a.disk, a.stage, a.iso, a.label, a.overwrite, a.check_only, prog, ask, tok)
         show(res["preflight"])
         if not res["preflight"]["ok"]:
             print("사전 검증에 실패해 ISO 를 만들지 않았습니다.")
@@ -1673,8 +1776,7 @@ def main(argv=None):
         if not folders:
             print("추가할 새 폴더가 없습니다.")
             return
-        nf, n, b = add_folders(conn, plan, folders,
-                               scan_progress())
+        nf, n, b = add_folders(conn, plan, folders, scan_progress(), tok)
         placed, touched = allocate_new(conn, plan)
         print(f"\n새 폴더 {nf}개, 파일 {n:,}개, {fmt(b)} → {placed:,}개 배정")
         print("내용이 바뀐 디스크: " + (", ".join(f"disk{t:02d}" for t in touched) or "없음"))
@@ -1686,7 +1788,7 @@ def main(argv=None):
         if locked_disks(conn, plan) and not a.force:
             raise SystemExit("이미 구운(또는 굽는 중) 디스크가 있어 전체 재스캔은 상태·배정을 모두 초기화합니다.\n"
                              "새 폴더만 추가하려면 'add' 를 쓰세요. 정말 초기화하려면 --force.")
-        n, b = scan(conn, plan, scan_progress())
+        n, b = scan(conn, plan, scan_progress(), tok)
         print(f"\n파일 {n:,}개, {fmt(b)}")
         dec, bi = estimate_disks(b, plan["capacity"])
         print(f"예상 디스크 수: 십진 {dec}장 / 이진 {bi}장")
@@ -1724,7 +1826,7 @@ def main(argv=None):
             "SELECT disk_no FROM disk WHERE plan_id=? ORDER BY disk_no", (plan["plan_id"],))]
         for n in nos:
             dest, csvp, made = export_disk(conn, plan, n, a.stage, not a.no_hardlink,
-                                           progress=cli_progress(f"disk{n:02d} 내보내기"))
+                                           progress=cli_progress(f"disk{n:02d} 내보내기"), cancel=tok)
             print(f"disk{n:02d}: {dest} (링크 {made}개), {csvp}")
     elif a.cmd == "status":
         set_status(conn, plan, a.disk, a.status); print("변경됨")
@@ -1743,9 +1845,9 @@ def main(argv=None):
         prog = cli_progress("비교")
         if a.via_copy:
             res = verify_via_copy(conn, plan, a.disk, stage_dir, a.media, a.via_copy, a.copy,
-                                  not a.keep_copy, prog)
+                                  not a.keep_copy, prog, tok)
         else:
-            res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog)
+            res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog, tok)
         print(f"\n{res['verdict']}: {summarize_compare(res)}")
         for r, e in res.get("copy_errors", [])[:30]:
             print(f"  디스크 읽기 실패: {r} ({e})")
