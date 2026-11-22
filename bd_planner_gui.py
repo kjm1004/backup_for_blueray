@@ -139,6 +139,7 @@ class App(tk.Tk):
         ttk.Label(hv, text="이력·검증:").pack(side="left")
         ttk.Button(hv, text="백업 완료 기록…", command=self.record_burn).pack(side="left", padx=6)
         ttk.Button(hv, text="스테이징↔미디어 비교…", command=self.run_media_compare).pack(side="left")
+        ttk.Button(hv, text="복사 후 비교…", command=self.run_copy_compare).pack(side="left", padx=6)
         ttk.Button(hv, text="이력 보기…", command=self.show_history).pack(side="left", padx=6)
 
         out = ttk.LabelFrame(right, text="⑤ 출력 (하드링크 스테이징 + INDEX.txt + 목록 CSV)")
@@ -151,6 +152,15 @@ class App(tk.Tk):
         self.export_btn.grid(row=0, column=3, padx=8)
         ttk.Label(out, text="※ 스테이징은 원본과 같은 NTFS 드라이브여야 합니다(하드링크, 용량 미사용).",
                   foreground="#555").grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(out, text="임시 복사 위치").grid(row=2, column=0, padx=6, pady=4)
+        self.temp_var = tk.StringVar()
+        ttk.Entry(out, textvariable=self.temp_var, width=26).grid(row=2, column=1, padx=4)
+        ttk.Button(out, text="찾아보기…", command=self.browse_temp).grid(row=2, column=2, padx=4)
+        self.deltmp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(out, text="일치하면 임시 복사본 삭제", variable=self.deltmp_var).grid(row=2, column=3, padx=8)
+        ttk.Label(out, text="※ '복사 후 비교'용. 미디어 크기만큼 여유 공간이 필요하며, 이 위치 아래 _bd_verify 폴더에만 씁니다. "
+                            "스테이징·미디어와 겹치면 안 됩니다.",
+                  foreground="#555").grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
         self.refresh_media_widgets()
         self.log = tk.Text(right, height=9, wrap="word")
@@ -169,6 +179,11 @@ class App(tk.Tk):
             self.root_var.set(os.path.normpath(d))
             if not self.name_var.get():
                 self.name_var.set(os.path.basename(os.path.normpath(d)) or "plan")
+
+    def browse_temp(self):
+        d = filedialog.askdirectory(title="임시 복사 위치 선택(여유 공간이 큰 하드디스크)")
+        if d:
+            self.temp_var.set(os.path.normpath(d))
 
     def browse_stage(self):
         d = filedialog.askdirectory(title="스테이징 폴더 선택")
@@ -464,7 +479,8 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ settings save / load
     def ui_values(self):
-        return {"unit": self.unit_var.get(), "capacity_text": self.cap_var.get(), "stage": self.stage_var.get()}
+        return {"unit": self.unit_var.get(), "capacity_text": self.cap_var.get(), "stage": self.stage_var.get(),
+                "temp": self.temp_var.get(), "delete_temp_when_ok": bool(self.deltmp_var.get())}
 
     def set_ui_values(self, ui):
         if ui.get("unit") in ("GB(십진)", "GiB(이진)"):
@@ -473,6 +489,10 @@ class App(tk.Tk):
             self.cap_var.set(ui["capacity_text"])
         if ui.get("stage") is not None:
             self.stage_var.set(ui["stage"])
+        if ui.get("temp") is not None:
+            self.temp_var.set(ui["temp"])
+        if ui.get("delete_temp_when_ok") is not None:
+            self.deltmp_var.set(bool(ui["delete_temp_when_ok"]))
 
     def save_settings(self):
         try:
@@ -524,7 +544,8 @@ class App(tk.Tk):
         cap = p.get("capacity_bytes")
         self.cap_var.set(ui.get("capacity_text") or (f"{cap / (core.GIB if unit_gib else core.GB):.6g}" if cap else "90"))
         self.ovh_var.set(str(p.get("overhead_per_file", 4096)))
-        self.set_ui_values({"stage": ui.get("stage")})
+        self.set_ui_values({"stage": ui.get("stage"), "temp": ui.get("temp"),
+                            "delete_temp_when_ok": ui.get("delete_temp_when_ok")})
         # 계획 생성/갱신(원본이 달라지면 확인)
         try:
             self.ensure_plan()
@@ -581,7 +602,8 @@ class App(tk.Tk):
                 var.set(st[key])
         if st.get("capacity_text"):
             self.cap_var.set(st["capacity_text"])
-        self.set_ui_values({"unit": st.get("unit"), "stage": st.get("stage")})
+        self.set_ui_values({"unit": st.get("unit"), "stage": st.get("stage"), "temp": st.get("temp"),
+                            "delete_temp_when_ok": st.get("delete_temp_when_ok")})
         if st.get("root") and st.get("name") and os.path.isdir(st["root"]):
             self.after(300, self.load_folders)
 
@@ -856,6 +878,62 @@ class App(tk.Tk):
             else:
                 messagebox.showwarning("불일치", f"disk{n:02d}: {core.summarize_compare(res)}\n자세한 목록은 로그를 보세요.")
         self.run_bg(fn, done, "미디어 비교 중…")
+
+    def run_copy_compare(self):
+        """미디어 → 임시 위치 복사 → 복사본↔스테이징 전체 비교."""
+        n = self.one_disk()
+        if n is None:
+            return
+        stage, temp = self.stage_var.get().strip(), self.temp_var.get().strip()
+        if not stage or not temp:
+            messagebox.showinfo("확인", "스테이징 위치와 임시 복사 위치를 먼저 지정하세요(⑤ 출력).")
+            return
+        stage_dir = os.path.join(stage, f"disk{n:02d}")
+        if not os.path.isdir(stage_dir):
+            messagebox.showerror("오류", f"스테이징 폴더가 없습니다:\n{stage_dir}\n먼저 내보내기를 하세요.")
+            return
+        if not os.path.isdir(temp):
+            messagebox.showerror("오류", f"임시 복사 위치에 접근할 수 없습니다:\n{temp}")
+            return
+        media = filedialog.askdirectory(title=f"disk{n:02d} 를 구운 미디어(드라이브) 선택")
+        if not media:
+            return
+        if not messagebox.askyesno(
+                "복사 후 비교",
+                f"1) 미디어의 파일을 모두 임시 위치로 복사합니다(읽기 오류는 파일별로 기록).\n"
+                f"2) 복사본을 스테이징과 전체(바이트) 비교합니다.\n\n임시 위치: {temp}\\_bd_verify\n"
+                "미디어 크기만큼 여유 공간이 필요하고 시간이 오래 걸립니다. 계속할까요?"):
+            return
+        plan, delete_ok = self.plan, bool(self.deltmp_var.get())
+        last = [0.0]
+
+        def fn(conn):
+            def prog(phase, f, t, b):
+                if time.time() - last[0] > 0.3:
+                    last[0] = time.time()
+                    self.q.put(("prog", None, f"{'복사' if phase == 'copy' else '비교'} 중… {f:,}/{t:,}개 · {core.fmt(b)}"))
+            return core.verify_via_copy(conn, core.get_plan(conn, plan["name"]), n, stage_dir, media, temp,
+                                        None, delete_ok, prog)
+
+        def done(res):
+            self.say(f"disk{n:02d} 복사 후 비교: {res['verdict']} — {core.summarize_compare(res)} "
+                     f"(복사 {res['copy_seconds'] / 60:.1f}분)")
+            for r, e in res["copy_errors"][:30]:
+                self.say(f"  디스크 읽기 실패: {r} ({e})")
+            for key, label in (("missing", "복사본에 없음"), ("extra", "복사본에만 있음"),
+                               ("content_diff", "내용 다름"), ("hidden_missing", "숨김/시스템(미포함)")):
+                for r in res[key][:30]:
+                    self.say(f"  {label}: {r}")
+            for r, ss, ds in res["size_diff"][:30]:
+                self.say(f"  크기 다름: {r} (스테이징 {ss:,} / 복사본 {ds:,})")
+            self.say(f"  임시 복사본: {res['temp_path']} ({'보존됨' if res['kept'] else '삭제함'})")
+            self.refresh_disks()
+            if res["ok"]:
+                messagebox.showinfo("검증 완료", f"disk{n:02d}: 미디어 내용이 스테이징과 모두 일치합니다. ('검증됨')")
+            else:
+                messagebox.showwarning("불일치", f"disk{n:02d}: {core.summarize_compare(res)}\n"
+                                       "임시 복사본은 남겨 두었습니다. 목록은 로그를 보세요.")
+        self.run_bg(fn, done, "복사 후 비교 중…")
 
     def show_history(self):
         if not self.plan:

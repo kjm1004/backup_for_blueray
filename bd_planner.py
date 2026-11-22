@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -826,19 +827,26 @@ def summarize_compare(res):
                        ("content_diff", "내용 다름"), ("read_errors", "읽기 오류")):
         if res[key]:
             parts.append(f"{label} {len(res[key])}")
+    if res.get("copy_errors"):
+        parts.append(f"디스크 읽기(복사) 실패 {len(res['copy_errors'])}")
     if res["hidden_missing"]:
         parts.append(f"숨김/시스템 파일 미포함 {len(res['hidden_missing'])}(정상 범위)")
     return ", ".join(parts)
 
 
 def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=None, progress=None):
-    """스테이징(원본)↔미디어 비교 후 이력에 기록. 전체(바이트) 비교가 모두 일치하면 상태를 '검증됨'으로.
+    """스테이징(원본)↔미디어 직접 비교 후 이력에 기록. 전체(바이트) 비교가 모두 일치하면 상태를 '검증됨'으로.
     copy_no 가 없으면 가장 최근 사본 기록에 결과를 붙이고, 사본 기록이 없으면 새로 만든다."""
     if not os.path.isdir(stage_dir):
         raise SystemExit(f"스테이징 폴더가 없습니다: {stage_dir}")
     if not os.path.isdir(media_dir):
         raise SystemExit(f"미디어 경로에 접근할 수 없습니다: {media_dir}")
     res = compare_dirs(stage_dir, media_dir, full, progress)
+    return _finish_verification(conn, plan, disk_no, res, full, f"미디어 {media_dir}", copy_no, "미디어 비교")
+
+
+def _finish_verification(conn, plan, disk_no, res, full, desc, copy_no=None, label="미디어 비교"):
+    """비교 결과를 사본 기록·이력·디스크 상태에 반영한다."""
     mode = "전체(바이트)" if full else "빠른(크기)"
     verdict = ("전체일치" if full else "빠른일치") if res["ok"] else "불일치"
     pid = plan["plan_id"]
@@ -854,7 +862,7 @@ def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=N
     if not (res["ok"] and not full and prev == "전체일치"):    # 빠른 검사가 앞선 전체 일치 기록을 덮지 않게
         conn.execute("UPDATE burn_record SET verified_at=?, verify_result=? WHERE rec_id=?",
                      (now(), verdict, rec[0]))
-    log_event(conn, plan, disk_no, f"미디어 비교 {mode}: {verdict}", f"{summarize_compare(res)} | 미디어 {media_dir}")
+    log_event(conn, plan, disk_no, f"{label} {mode}: {verdict}", f"{summarize_compare(res)} | {desc}")
     status = conn.execute("SELECT status FROM disk WHERE plan_id=? AND disk_no=?", (pid, disk_no)).fetchone()[0]
     if res["ok"] and full:
         set_status(conn, plan, disk_no, "검증됨", log=False)
@@ -866,6 +874,112 @@ def verify_media(conn, plan, disk_no, stage_dir, media_dir, full=True, copy_no=N
             log_event(conn, plan, disk_no, "상태 강등", "'검증됨' → '완료' (최근 비교 불일치, 일치한 다른 사본 없음)")
     conn.commit()
     res["verdict"] = verdict
+    return res
+
+
+# ---------------------------------------------------------------- verify via copy (media -> temp -> compare)
+TMP_MARKER = ".bd_planner_tmp"
+TMP_DIRNAME = "_bd_verify"
+
+
+def _related(a, b):
+    """두 경로가 같거나 한쪽이 다른 쪽 안에 들어 있는가."""
+    a, b = os.path.normcase(os.path.realpath(a)), os.path.normcase(os.path.realpath(b))
+    try:
+        return os.path.commonpath([a, b]) in (a, b)
+    except ValueError:                  # 드라이브가 다름
+        return False
+
+
+def copy_media(src, dst, progress=None):
+    """미디어(src)의 모든 파일을 dst 로 복사한다. 읽기 실패는 파일별로 모아 두고 계속 진행한다(중단하지 않음).
+    progress(done_files, total_files, done_bytes, total_bytes). 복사 실패 [(rel, 오류)], 복사한 바이트를 반환."""
+    base = long_path(src)
+    files, total = [], 0
+    for d, dirs, fs in os.walk(base):
+        dirs[:] = [x for x in dirs if x.lower() not in _SKIP_NAMES]
+        for f in fs:
+            full = os.path.join(d, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            files.append((os.path.relpath(full, base), full, size))
+            total += size
+    free = shutil.disk_usage(dst).free
+    if free < total + 256 * 1024 ** 2:
+        raise SystemExit(f"임시 위치의 여유 공간이 부족합니다: 필요 {total / GB:.1f} GB, 여유 {free / GB:.1f} GB")
+    errors, done_b = [], 0
+    files.sort(key=lambda r: natural_key(r[0]))
+    for i, (rel, full, size) in enumerate(files, 1):
+        out = long_path(os.path.join(dst, rel))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        try:
+            with open(full, "rb") as fi, open(out, "wb") as fo:
+                while True:
+                    chunk = fi.read(CHUNK)
+                    if not chunk:
+                        break
+                    fo.write(chunk)
+                    done_b += len(chunk)
+                    if progress:
+                        progress(i, len(files), done_b, total)
+            try:
+                shutil.copystat(full, out)
+            except OSError:
+                pass
+        except OSError as e:
+            if getattr(e, "errno", None) == 28:       # ENOSPC
+                raise SystemExit("임시 위치의 공간이 부족해 복사를 중단했습니다.")
+            errors.append((rel, str(e)))
+            try:
+                os.remove(out)                        # 불완전한 파일이 일치로 오인되지 않게 지운다
+            except OSError:
+                pass
+        if progress:
+            progress(i, len(files), done_b, total)
+    return errors, done_b
+
+
+def verify_via_copy(conn, plan, disk_no, stage_dir, media_dir, temp_root, copy_no=None,
+                    delete_when_ok=True, progress=None):
+    """① 미디어의 파일을 temp_root 아래 임시 폴더로 복사 → ② 복사본을 스테이징과 전체(바이트) 비교 → 이력 기록.
+    임시 폴더는 temp_root/_bd_verify/<계획>_diskNN 이며, 이 프로그램이 만든 표식 파일이 있는 폴더만 지운다.
+    복사 중 읽기 실패한 파일이 있으면 불일치로 판정하고 복사본은 남겨 둔다.
+    progress(phase, done_files, total_files, done_bytes) — phase 는 'copy' 또는 'compare'."""
+    for p, what in ((stage_dir, "스테이징 폴더"), (media_dir, "미디어 경로"), (temp_root, "임시 위치")):
+        if not p or not os.path.isdir(p):
+            raise SystemExit(f"{what}에 접근할 수 없습니다: {p}")
+    target = os.path.join(temp_root, TMP_DIRNAME, f"{plan['name']}_disk{disk_no:02d}")
+    if _related(target, stage_dir) or _related(target, media_dir) or _related(temp_root, media_dir):
+        raise SystemExit("임시 위치가 스테이징 폴더나 미디어와 겹칩니다. 다른 위치를 지정하세요.")
+    if os.path.isdir(target):
+        if not os.path.exists(os.path.join(target, TMP_MARKER)):
+            raise SystemExit(f"이미 있는 폴더라 지우지 않았습니다(이 프로그램이 만든 것이 아님): {target}")
+        shutil.rmtree(long_path(target))                # 이전 검증의 임시 복사본만 정리
+    os.makedirs(long_path(target))
+    with open(os.path.join(target, TMP_MARKER), "w", encoding="utf-8") as fh:
+        fh.write(f"bd_planner temp copy of disk{disk_no:02d} {now()}\n")
+
+    t0 = time.time()
+    copy_errors, copied = copy_media(media_dir, target,
+                                     (lambda f, t, b, tb: progress("copy", f, t, b)) if progress else None)
+    copy_secs = time.time() - t0
+    res = compare_dirs(stage_dir, target, True,
+                       (lambda f, t, b: progress("compare", f, t, b)) if progress else None)
+    res["extra"] = [r for r in res["extra"] if r.lower() != TMP_MARKER]      # 표식 파일은 비교 대상이 아님
+    res["copy_errors"] = copy_errors
+    res["ok"] = not (res["missing"] or res["extra"] or res["size_diff"] or res["content_diff"]
+                     or res["read_errors"] or copy_errors)
+    res["temp_path"], res["copy_seconds"], res["copied_bytes"] = target, copy_secs, copied
+    res = _finish_verification(conn, plan, disk_no, res, True,
+                               f"미디어 {media_dir} → 임시 복사 {fmt(copied)} ({copy_secs / 60:.0f}분) → {target}",
+                               copy_no, "미디어 비교(복사 경유)")
+    if res["ok"] and delete_when_ok:
+        shutil.rmtree(long_path(target), ignore_errors=True)
+        res["kept"] = False
+    else:
+        res["kept"] = True
     return res
 
 
@@ -1017,6 +1131,9 @@ def main(argv=None):
     p.add_argument("--media", required=True, help="미디어(굽은 디스크) 드라이브/경로")
     p.add_argument("--quick", action="store_true", help="내용 비교 없이 존재·크기만 확인")
     p.add_argument("--copy", type=int, help="결과를 붙일 사본 번호(생략 시 최근 사본)")
+    p.add_argument("--via-copy", metavar="TEMP_ROOT",
+                   help="미디어 파일을 이 위치의 임시 폴더로 먼저 복사한 뒤, 복사본을 스테이징과 비교(항상 전체 비교)")
+    p.add_argument("--keep-copy", action="store_true", help="--via-copy 일치해도 임시 복사본을 지우지 않음")
     p = sub.add_parser("verify", help="경로·크기를 DB 와 대조(내용 비교 아님)")
     p.add_argument("name"); p.add_argument("disk", type=int); p.add_argument("path")
     a = ap.parse_args(argv)
@@ -1163,8 +1280,20 @@ def main(argv=None):
             if time.time() - last[0] > 0.5:
                 last[0] = time.time()
                 print(f"\r비교 {f:,}/{t:,}개  {fmt(b)}", end="", file=sys.stderr)
-        res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog)
+        if a.via_copy:
+            def vprog(phase, f, t, b):
+                if time.time() - last[0] > 0.5:
+                    last[0] = time.time()
+                    print(f"\r{'복사' if phase == 'copy' else '비교'} {f:,}/{t:,}개  {fmt(b)}", end="", file=sys.stderr)
+            res = verify_via_copy(conn, plan, a.disk, stage_dir, a.media, a.via_copy, a.copy,
+                                  not a.keep_copy, vprog)
+        else:
+            res = verify_media(conn, plan, a.disk, stage_dir, a.media, not a.quick, a.copy, prog)
         print(f"\n{res['verdict']}: {summarize_compare(res)}")
+        for r, e in res.get("copy_errors", [])[:30]:
+            print(f"  디스크 읽기 실패: {r} ({e})")
+        if a.via_copy:
+            print(f"  임시 복사본: {res['temp_path']} ({'보존' if res['kept'] else '삭제함'}), 복사 {res['copy_seconds'] / 60:.1f}분")
         for key, label in (("missing", "미디어에 없음"), ("extra", "미디어에만 있음"), ("content_diff", "내용 다름"),
                            ("hidden_missing", "숨김/시스템(미포함)")):
             for r in res[key][:30]:
